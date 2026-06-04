@@ -19,8 +19,13 @@ main.ipynb
 # SLURM job output logs
 Eval-*.txt
 TG_base-*.txt
+TG_base_slaf-*.txt
 models/rq3_finetune-*.txt
 models/rq4_finetune-*.txt
+models/slurm/logs/
+
+# Diagnostic / scratch caches
+expr_debug/
 
 # Binary artifacts
 *.zip
