@@ -418,8 +418,6 @@ def soft_correlation(
             if return_list:
                 pred_sum[0] = pred_sum[0] + 1e-15
                 correlations_all.append(corr_fn(gt_sum, pred_sum)[0])
-            if i % 10000 == 0 and i > 0:
-                print(f"Processed {i} samples...")
 
         if return_list:
             return correlations_all
@@ -562,8 +560,6 @@ def soft_f1(
             recalls.append(r)
             f1s.append(f1)
 
-            if i and i % 10000 == 0:
-                print(f"Processed {i} spots...")
 
         if return_list:
             return f1s

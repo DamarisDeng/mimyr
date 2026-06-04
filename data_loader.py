@@ -9,6 +9,9 @@ from gene_exp_model import GeneExpModel
 from models.generative_transformer.data_util import harmonize_dataset
 import torch
 
+from loguru import logger as _loguru_logger
+_loguru_logger.disable("slaf")
+
 
 def _read_slice(path: str, backed: bool = False):
     """Read a slice file, auto-detecting .slaf or .h5ad format.
@@ -213,6 +216,8 @@ class SliceDataLoader:
             ]
         for s in slices1:
             s.obs["technology"] = "M550"
+            s.obs['disease_state'] = 'healthy'
+            s.obs['species'] = 'mouse'
         return slices1
 
     def _compute_rq1_train_indices_by_z_ccf(self, test_slices, rq1_eligible_indices):

@@ -269,8 +269,9 @@ def summarize_sample_ddp(
     """
     Aggregate per-rank counts to rank 0 and print global stats.
     """
-    rank = dist.get_rank()
-    world = dist.get_world_size()
+    ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if ddp else 0
+    world = dist.get_world_size() if ddp else 1
 
     # Build local counts as dicts (to gather easily)
     ct_local = (
@@ -288,8 +289,11 @@ def summarize_sample_ddp(
         grp_local = {}
 
     objs = [ct_local, grp_local]
-    gathered = [None for _ in range(world)]
-    dist.all_gather_object(gathered, objs)
+    if ddp:
+        gathered = [None for _ in range(world)]
+        dist.all_gather_object(gathered, objs)
+    else:
+        gathered = [objs]
 
     # Merge across ranks
     ct_all = _merge_counts([g[0] for g in gathered])

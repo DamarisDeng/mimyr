@@ -94,11 +94,24 @@ torchrun --nproc_per_node=<NUM_GPUS> main.py \
 
 Use `--skip_combined_fit` to skip retraining the location and cell type models and go straight to expression model training. After training, rerun `main.py` in inference mode using the newly saved checkpoints to generate predictions.
 
-Ready-to-use SLURM sbatch scripts for base training and finetuning are provided in `models/`:
-- `models/run_train_base_noreweight.sbatch` — base expression model training (rq1)
-- `models/run_finetune_rq3.sbatch` — finetuning on rq3 data
-- `models/run_finetune_rq4.sbatch` — finetuning on rq4 data
+Ready-to-use SLURM sbatch scripts for base training and finetuning are provided in `models/slurm/`:
+- `models/slurm/run_train_base_noreweight.sbatch` — base expression model training (rq1)
+- `models/slurm/run_finetune_rq3.sbatch` — finetuning on rq3 data
+- `models/slurm/run_finetune_rq4.sbatch` — finetuning on rq4 data
 
+
+### Configuration Files
+
+Rather than specifying all flags on the command line, you can collect them in a YAML config file and pass it via `--config`:
+
+```bash
+python main.py --config config.yaml
+torchrun --nproc_per_node=3 main.py --config config.yaml --run_mode train
+```
+
+Any key in the config file maps directly to a CLI argument (e.g. `data_dir:`, `expression_model_checkpoint:`). Explicit CLI flags always take precedence over config file values, so you can use a shared base config and override individual settings per run.
+
+A default `config.yaml` is provided at the repository root with common data paths, checkpoint paths, and output directories. The `configs/` directory contains per-experiment config files used by the SLURM scripts in `models/slurm/`.
 
 ### Other Command-Line Arguments
 
@@ -164,26 +177,31 @@ The pipeline generates:
 ## Project Structure
 ```
 MIMYR/
+├── config.yaml                  # Default config values; override with --config
+├── configs/                     # Per-experiment config files for SLURM runs
+├── gene_overlap.txt             # Shared gene set for rq1/rq3 evaluation
+├── requirements.txt             # Python package dependencies
+├── main.py                      # Single entry point (inference and train modes)
+├── data_loader.py               # SliceDataLoader: data loading and preprocessing
+├── inference.py                 # Inference pipeline
+├── evaluator.py                 # Evaluation metrics
+├── metrics.py                   # Metric implementations
+├── gene_exp_model.py            # Gene expression tokenization utilities
 ├── models/
 │   ├── diffusion_model.py            # DDPM location model
 │   ├── celltype_model.py             # Cell type classifier
 │   ├── biological_model.py           # KDE-based spatial prior
 │   ├── combined_model.py             # Wraps location + celltype models
-│   ├── gene_exp_model.py             # Gene expression tokenization utilities
 │   ├── __init__.py                   # Makes models/ a package
 │   ├── generative_transformer/       # Transformer-based expression model
 │   │   ├── Mimyr.py                  # MimyrModel architecture
 │   │   ├── finetune_mimyr.py         # Expression model training logic (DDP-aware)
 │   │   ├── data_util.py              # Data harmonization utilities
-│   │   └── __init__.py              # Exports train_expression_model, get_expression_parser
-│   ├── run_train_base_noreweight.sbatch  # SLURM: base training (rq1, 3 GPUs)
-│   ├── run_finetune_rq3.sbatch           # SLURM: rq3 finetuning
-│   └── run_finetune_rq4.sbatch           # SLURM: rq4 finetuning
-├── data_loader.py               # SliceDataLoader: data loading and preprocessing
-├── inference.py                 # Inference pipeline
-├── evaluator.py                 # Evaluation metrics
-├── metrics.py                   # Metric implementations
-├── main.py                      # Single entry point (inference and train modes)
+│   │   ├── model/                    # Core transformer implementation
+│   │   ├── reference/                # Reference gene symbol data
+│   │   ├── utils/                    # Tokenizer and other utilities
+│   │   └── __init__.py               # Exports train_expression_model, get_expression_parser
+│   └── slurm/                        # SLURM sbatch scripts for training runs
 └── model_checkpoints/           # Pretrained model weights
 ```
 
