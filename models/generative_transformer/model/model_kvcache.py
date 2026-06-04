@@ -405,6 +405,7 @@ class MimyrModel_kv(nn.Module):
         override_gene_sequence=None,
         override_expr_sequence=None,
         verbose=False,
+        select_max_index_margin=0.01,
     ):
         """
         Behavior is identical to the original version:
@@ -448,6 +449,15 @@ class MimyrModel_kv(nn.Module):
         eos_id = 0
         eos_threshold = 0.95  # same as your original
 
+        # --- no-retrain bin-decode experiment ----------------------------------
+        # How the per-step expression BIN (recorded + fed back via wee) is chosen.
+        # Default "argmax" reproduces the original behavior byte-for-byte. "expected"
+        # uses the posterior-mean bin (robust to a flat/zero-dominated bin head, which
+        # is what collapses under autoregressive feedback); "sample" draws from the
+        # tempered categorical. Controlled by env vars so no signatures change.
+        _bin_mode = os.environ.get("MIMYR_BIN_DECODE", "argmax")
+        _bin_temp = float(os.environ.get("MIMYR_BIN_TEMP", "1.0"))
+
         while write_pos < Tmax:
             # Forward pass
             if first_time:
@@ -488,10 +498,9 @@ class MimyrModel_kv(nn.Module):
 
             seen = out_idx[:, :write_pos]  # (B, T_prev)
             seen_mask = torch.zeros_like(logits_cls_step, dtype=torch.bool)  # (B, V)
-            # Clamp in case negatives are possible; remove if your tokens are always >= 0
             seen = seen.clamp_min(0)
             seen_mask.scatter_(1, seen, True)
-            # Allow EOS to reappear multiple times? Keep as original: do not unmask eos
+            seen_mask[:, eos_id] = False  # padding zeros must not block EOS termination
             logits_cls_step = logits_cls_step.masked_fill(seen_mask, float("-inf"))
 
             # Optional top-k -> identical semantics as original (mask non-topk to -inf)
@@ -504,21 +513,57 @@ class MimyrModel_kv(nn.Module):
                     logits_cls_step >= kth, logits_cls_step, neg_inf
                 )
 
+            # mask tokens with index >= previous token (enforce strictly decreasing order)
+            prev_tokens = out_idx[:, write_pos - 1]  # (B,)
+            token_range = torch.arange(logits_cls_step.size(-1), device=logits_cls_step.device).unsqueeze(0)
+            logits_cls_step = logits_cls_step.masked_fill(token_range >= prev_tokens.unsqueeze(1), float("-inf"))
+
             # Softmax and sample over the (masked) full vocab
             probs = F.softmax(logits_cls_step, dim=-1)
-
-            # Forced-EOS identical to original
             forced_eos = probs[:, eos_id] >= eos_threshold
 
-            sampled_tokens = torch.multinomial(probs, num_samples=1)  # (B,1)
-            next_token = torch.where(
-                forced_eos.unsqueeze(1),
-                sampled_tokens.new_full((B, 1), eos_id),
-                sampled_tokens,
-            )
+            if select_max_index_margin > 0.0:
+                # Among still-allowed (finite) tokens whose probability is within
+                # `margin` of the top probability, pick the HIGHEST token index.
+                # The argmax is always within the margin (diff 0), so this returns
+                # the argmax unless a higher-index token is also within the margin —
+                # it never falls back to sampling.
+                max_prob = probs.max(dim=-1, keepdim=True).values  # (B,1)
+                eligible = ((max_prob - probs) < select_max_index_margin) & torch.isfinite(logits_cls_step)  # (B,V)
+                token_indices = torch.arange(
+                    logits_cls_step.size(-1), device=logits_cls_step.device
+                ).unsqueeze(0).expand_as(logits_cls_step)
+                next_token_raw = token_indices.masked_fill(~eligible, -1).max(dim=-1, keepdim=True).values  # (B,1)
+                next_token = torch.where(
+                    forced_eos.unsqueeze(1),
+                    next_token_raw.new_full((B, 1), eos_id),
+                    next_token_raw,
+                )
+            else:
+                sampled_tokens = torch.multinomial(probs, num_samples=1)  # (B,1)
+                next_token = torch.where(
+                    forced_eos.unsqueeze(1),
+                    sampled_tokens.new_full((B, 1), eos_id),
+                    sampled_tokens,
+                )
 
             # Binned expression for this step
-            bin_next = torch.argmax(logits_bins_step, dim=-1, keepdim=True)  # (B,1)
+            if _bin_mode == "argmax":
+                bin_next = torch.argmax(logits_bins_step, dim=-1, keepdim=True)  # (B,1)
+            else:
+                probs_bin = F.softmax(logits_bins_step / _bin_temp, dim=-1)  # (B,E)
+                if _bin_mode == "expected":
+                    levels = torch.arange(
+                        logits_bins_step.size(-1),
+                        device=logits_bins_step.device,
+                        dtype=probs_bin.dtype,
+                    )
+                    exp_bin = (probs_bin * levels).sum(dim=-1, keepdim=True)  # (B,1) float
+                    bin_next = exp_bin.round().long().clamp_(0, logits_bins_step.size(-1) - 1)
+                elif _bin_mode == "sample":
+                    bin_next = torch.multinomial(probs_bin, num_samples=1)  # (B,1)
+                else:
+                    raise ValueError(f"unknown MIMYR_BIN_DECODE={_bin_mode!r}")
 
             # Accumulate step outputs (same shapes as before)
             pred_gene_steps.append(next_token)  # (B,1)
@@ -575,6 +620,7 @@ class MimyrModel_kv(nn.Module):
         override_gene_sequence=None,
         override_expr_sequence=None,
         verbose=False,
+        select_max_index_margin=0.01,
     ):
         """
         Pruned decoding with correct KV-cache indexing.
@@ -607,6 +653,13 @@ class MimyrModel_kv(nn.Module):
         write_pos = T0
         eos_id = 0
         eos_threshold = 0.95
+
+        # No-retrain bin-decode experiment (see generate_cellGenesis). This is the
+        # fast path actually used at inference (Mimyr.generate ... fast=True). Default
+        # "argmax" is byte-identical to original; "expected"/"sample" change how the
+        # per-step bin (recorded + fed back via wee) is chosen.
+        _bin_mode = os.environ.get("MIMYR_BIN_DECODE", "argmax")
+        _bin_temp = float(os.environ.get("MIMYR_BIN_TEMP", "1.0"))
 
         # Start with ALL rows in the cache, in original order
         alive = torch.arange(
@@ -698,11 +751,17 @@ class MimyrModel_kv(nn.Module):
             seen_active = seen_active.clamp(min=0, max=V - 1).to(dtype=torch.long)
             seen_mask = torch.zeros_like(logits_cls_step, dtype=torch.bool)  # (Ba, V)
             seen_mask.scatter_(1, seen_active, True)
+            seen_mask[:, eos_id] = False  # padding zeros must not block EOS termination
             logits_cls_step = logits_cls_step.masked_fill(seen_mask, float("-inf"))
 
             # Optional safe top-k
             if top_k is not None:
                 logits_cls_step = _safe_topk_mask_(logits_cls_step, top_k)
+
+            # mask tokens with index >= previous token (enforce strictly decreasing order)
+            prev_tokens_active = last_tok_active.squeeze(1)  # (Ba,)
+            token_range = torch.arange(logits_cls_step.size(-1), device=logits_cls_step.device).unsqueeze(0)
+            logits_cls_step = logits_cls_step.masked_fill(token_range >= prev_tokens_active.unsqueeze(1), float("-inf"))
 
             # Ensure at least one finite logit per row (EOS fallback)
             row_has_finite = torch.isfinite(logits_cls_step).any(dim=1)
@@ -715,17 +774,53 @@ class MimyrModel_kv(nn.Module):
             # Sample
             probs = F.softmax(logits_cls_step, dim=-1)
             forced_eos = probs[:, eos_id] >= eos_threshold
-            sampled_tokens = torch.multinomial(probs, num_samples=1)  # (Ba,1)
-            next_token_active = torch.where(
-                forced_eos.unsqueeze(1),
-                sampled_tokens.new_full((sampled_tokens.size(0), 1), eos_id),
-                sampled_tokens,
-            )  # (Ba,1)
+
+            if select_max_index_margin > 0.0:
+                # Among still-allowed (finite) tokens whose probability is within
+                # `margin` of the top probability, pick the HIGHEST token index.
+                # The argmax is always within the margin (diff 0), so this returns
+                # the argmax unless a higher-index token is also within the margin —
+                # it never falls back to sampling.
+                max_prob = probs.max(dim=-1, keepdim=True).values  # (Ba,1)
+                eligible = ((max_prob - probs) < select_max_index_margin) & torch.isfinite(logits_cls_step)  # (Ba,V)
+                token_indices = torch.arange(
+                    logits_cls_step.size(-1), device=logits_cls_step.device
+                ).unsqueeze(0).expand_as(logits_cls_step)
+                next_token_raw = token_indices.masked_fill(~eligible, -1).max(dim=-1, keepdim=True).values  # (Ba,1)
+                next_token_active = torch.where(
+                    forced_eos.unsqueeze(1),
+                    next_token_raw.new_full((next_token_raw.size(0), 1), eos_id),
+                    next_token_raw,
+                )  # (Ba,1)
+            else:
+                sampled_tokens = torch.multinomial(probs, num_samples=1)  # (Ba,1)
+                next_token_active = torch.where(
+                    forced_eos.unsqueeze(1),
+                    sampled_tokens.new_full((sampled_tokens.size(0), 1), eos_id),
+                    sampled_tokens,
+                )  # (Ba,1)
 
             # Expression-bin for active rows
-            bin_next_active = torch.argmax(
-                logits_bins_step, dim=-1, keepdim=True
-            )  # (Ba,1)
+            if _bin_mode == "argmax":
+                bin_next_active = torch.argmax(
+                    logits_bins_step, dim=-1, keepdim=True
+                )  # (Ba,1)
+            else:
+                probs_bin = F.softmax(logits_bins_step / _bin_temp, dim=-1)  # (Ba,E)
+                if _bin_mode == "expected":
+                    levels = torch.arange(
+                        logits_bins_step.size(-1),
+                        device=logits_bins_step.device,
+                        dtype=probs_bin.dtype,
+                    )
+                    exp_bin = (probs_bin * levels).sum(dim=-1, keepdim=True)  # (Ba,1)
+                    bin_next_active = exp_bin.round().long().clamp_(
+                        0, logits_bins_step.size(-1) - 1
+                    )
+                elif _bin_mode == "sample":
+                    bin_next_active = torch.multinomial(probs_bin, num_samples=1)  # (Ba,1)
+                else:
+                    raise ValueError(f"unknown MIMYR_BIN_DECODE={_bin_mode!r}")
 
             # Build full-batch (B,1) outputs for this step and scatter active results
             tok_full = input_ids.new_full((B, 1), eos_id)
@@ -834,6 +929,10 @@ def _pkv_index_select(past_key_values, rel_index):
     """
     if past_key_values is None:
         return None
+    # Fast path: selecting all rows — alive is already pruned to unfinished rows,
+    # so rel_index is always [0..N-1] here; skip the full copy.
+    if rel_index.numel() == past_key_values[0][0].size(0):
+        return past_key_values
     new_pkv = []
     for k, v in past_key_values:
         new_k = k.index_select(0, rel_index)

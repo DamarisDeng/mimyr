@@ -716,6 +716,7 @@ class MimyrModel(nn.Module):
         override_gene_sequence: Optional[torch.LongTensor] = None,
         override_expr_sequence: Optional[torch.LongTensor] = None,
         verbose: bool = False,
+        select_max_index_margin: float = 0.0,
     ):
         """
         Autoregressively generate gene tokens *and* real-valued expression.
@@ -764,13 +765,33 @@ class MimyrModel(nn.Module):
                 v, _ = torch.topk(logits_cls, min(top_k, logits_cls.size(-1)), dim=-1)
                 logits_cls[logits_cls < v[:, [-1]]] = float("-inf")
 
+            # mask tokens with index >= previous token (enforce strictly decreasing order)
+            prev_tokens = input_ids[:, -1]  # (B,)
+            token_range = torch.arange(logits_cls.size(-1), device=logits_cls.device).unsqueeze(0)
+            logits_cls = logits_cls.masked_fill(token_range >= prev_tokens.unsqueeze(1), float("-inf"))
+
             if return_dict_in_generate:
                 scores += (logits_cls,)
 
             # 4) sample model predictions
             probs = F.softmax(logits_cls, dim=-1)
-            probs[:, 0] = gamma * probs[:, 0]
-            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            if select_max_index_margin > 0.0:
+                # Among still-allowed (finite) tokens whose probability is within
+                # `margin` of the top probability, pick the HIGHEST token index.
+                # The argmax is always within the margin (diff 0), so this returns
+                # the argmax unless a higher-index token is also within the margin —
+                # it never falls back to sampling.
+                forced_eos = probs[:, 0] >= 0.95
+                max_prob = probs.max(dim=-1, keepdim=True).values  # (B,1)
+                eligible = ((max_prob - probs) < select_max_index_margin) & torch.isfinite(logits_cls)  # (B,V)
+                token_indices = torch.arange(
+                    logits_cls.size(-1), device=logits_cls.device
+                ).unsqueeze(0).expand_as(logits_cls)
+                next_token_raw = token_indices.masked_fill(~eligible, -1).max(dim=-1, keepdim=True).values  # (B,1)
+                next_token = torch.where(forced_eos.unsqueeze(1), next_token_raw.new_full((next_token_raw.size(0), 1), 0), next_token_raw)
+            else:
+                probs[:, 0] = gamma * probs[:, 0]
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
             # Mark items that have generated EOS (0)
             newly_finished = next_token.squeeze(1) == 0

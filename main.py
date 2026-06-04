@@ -18,6 +18,7 @@ import pickle as pkl
 
 import json
 import gc
+from concurrent.futures import ThreadPoolExecutor
 
 
 np.random.seed(42)
@@ -184,6 +185,12 @@ def get_args():
         help="Output CSV file path",
     )
     parser.add_argument(
+        "--eval_workers",
+        type=int,
+        default=1,
+        help="Number of parallel CPU threads for evaluation across slices (default 1 = serial)",
+    )
+    parser.add_argument(
         "--meta_info",
         type=str,
         default="4hierarchy_metainfo_mouse_geneunion2_DAG.pt",
@@ -327,6 +334,55 @@ def get_args():
         "--expression_preprocess_only", action="store_true",
         help="Cache train.h5ad/val.h5ad to output_dir and exit without training. No-op if cache exists.",
     )
+    parser.add_argument(
+        "--expression_select_max_index_margin", type=float, default=0.01,
+        help="If >0, use the highest-index top-k token only when its probability is within this margin of the top probability; otherwise sample normally. 0 disables the behaviour.",
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=5,
+        help="Top-k sampling for expression model generation",
+    )
+    parser.add_argument(
+        "--expression_ordinal_bin_sigma", type=float, default=0.0,
+        help="If >0, the expression-bin loss uses a Gaussian soft target over bin indices (ordinal-aware) with this std; 0 = standard hard cross-entropy",
+    )
+    parser.add_argument(
+        "--expression_lr_schedule", type=str, default="none", choices=["none", "cosine"],
+        help="LR schedule for expression model training: 'cosine' = linear warmup then cosine decay; 'none' = constant LR",
+    )
+    parser.add_argument(
+        "--expression_warmup_frac", type=float, default=0.0,
+        help="Fraction of total training steps used for linear LR warmup (cosine schedule only)",
+    )
+    parser.add_argument(
+        "--expression_min_lr_ratio", type=float, default=0.1,
+        help="Final LR as a fraction of peak LR at the end of the cosine schedule",
+    )
+    # --- bin-channel scheduled sampling (exposure-bias fix on the expression-bin feedback) ---
+    parser.add_argument(
+        "--expression_bin_ss_eps_max", type=float, default=0.0,
+        help="Max mixing prob for bin-channel scheduled sampling (fraction of generated-position "
+             "bins fed back from the model's own predictions; gene tokens stay teacher-forced). "
+             "0 = disabled (byte-identical to plain teacher forcing).",
+    )
+    parser.add_argument(
+        "--expression_bin_ss_schedule", type=str, default="linear",
+        choices=["constant", "linear", "sigmoid"],
+        help="Epsilon ramp over epochs after warmup for bin-channel scheduled sampling.",
+    )
+    parser.add_argument(
+        "--expression_bin_ss_warmup_epochs", type=int, default=0,
+        help="Initial epochs with eps=0 (pure teacher forcing) before the bin-ss ramp.",
+    )
+    parser.add_argument(
+        "--expression_bin_ss_feedback", type=str, default="argmax",
+        choices=["argmax", "sample"],
+        help="How the fed-back bin is decoded in bin-ss pass 1: argmax or sample.",
+    )
+    parser.add_argument(
+        "--expression_bin_ss_temp", type=float, default=1.0,
+        help="Temperature for --expression_bin_ss_feedback sample (ignored for argmax).",
+    )
 
     # Two-pass: extract --config first, load YAML, set as new defaults, then re-parse
     # so that explicit CLI flags still take precedence over the config file.
@@ -373,6 +429,13 @@ def already_done(cfg, path):
     row = pd.Series({k: cfg[k] for k in check_cols})
     df, row = df.align(row, axis=1)
     return any((df == row).all(axis=1))
+
+
+def _evaluate_slice(pred, gt_slice, cfg_copy, metadata_dir, gene_set_file, metric_sampling, metric_filter_by_gt):
+    res = Evaluator(cfg_copy, metadata_dir=metadata_dir, gene_set_file=gene_set_file).evaluate(
+        pred, gt_slice, sample=metric_sampling, filter_by_gt=metric_filter_by_gt,
+    )
+    return {k: float(v) for k, v in res.items()}
 
 
 # ----------------- main -----------------
@@ -491,15 +554,30 @@ def main():
             omit_x=getattr(args, "omit_x", False),
             save_per_cell_metrics=getattr(args, "expression_save_per_cell_metrics", False),
             preprocess_only=getattr(args, "expression_preprocess_only", False),
+            select_max_index=getattr(args, "expression_select_max_index", False),
+            ordinal_bin_sigma=getattr(args, "expression_ordinal_bin_sigma", 0.0),
+            lr_schedule=getattr(args, "expression_lr_schedule", "none"),
+            warmup_frac=getattr(args, "expression_warmup_frac", 0.0),
+            min_lr_ratio=getattr(args, "expression_min_lr_ratio", 0.1),
+            # bin-channel scheduled sampling
+            bin_ss_eps_max=getattr(args, "expression_bin_ss_eps_max", 0.0),
+            bin_ss_schedule=getattr(args, "expression_bin_ss_schedule", "linear"),
+            bin_ss_warmup_epochs=getattr(args, "expression_bin_ss_warmup_epochs", 0),
+            bin_ss_feedback=getattr(args, "expression_bin_ss_feedback", "argmax"),
+            bin_ss_temp=getattr(args, "expression_bin_ss_temp", 1.0),
         )
         _train_expression_model(expr_args)
         exit(0)
 
 
+    # Phase 1: serial GPU inference — collect all predictions before evaluating
+    inference_results = []  # list of (pred, gt_slice, cfg_copy)
+
     for i, slice in enumerate(temp_test_slices):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cfg["artifact_dir"] = f"{artifact_dir}/{timestamp}"
-        os.makedirs(cfg["artifact_dir"], exist_ok=True)
+        cfg_copy = copy.deepcopy(cfg)
+        cfg_copy["artifact_dir"] = f"{artifact_dir}/{timestamp}"
+        os.makedirs(cfg_copy["artifact_dir"], exist_ok=True)
 
         slice_data_loader.test_slices = [slice]
 
@@ -509,8 +587,7 @@ def main():
         if len(slice_data_loader.reference_slices) == 0:
             slice_data_loader.reference_slices = temp_ref_slices[-2:]
 
-        cfg["slice_index"] = i
-
+        cfg_copy["slice_index"] = i
 
         closest_ref_slice = np.argsort(
             [
@@ -533,55 +610,65 @@ def main():
                 "aligned_spatial"
             ][:, :2]
 
-
         kdemodel = KDEModelForGuidance(
             [best_ref_slice], bandwidth=args.kde_bandwidth
         )
         kdemodel.fit()
 
-
-        if already_done(cfg, args.out_csv):
-            print("skip", cfg)
-            return
+        if already_done(cfg_copy, args.out_csv):
+            print("skip", cfg_copy)
+            continue
 
         inf = Inference(
-            combined_model, 
+            combined_model,
             kdemodel,
             slice_data_loader,
-            copy.deepcopy(cfg),
+            cfg_copy,
         )
 
         pred = inf.run_inference(slice_data_loader.test_slices)
-        print("Sending pred to evaluator...", pred)
-        res = Evaluator(cfg, metadata_dir=args.expression_metadata_dir, gene_set_file=args.metric_gene_set_file).evaluate(
-            pred, slice_data_loader.test_slices[0], sample=args.metric_sampling,
-            filter_by_gt=args.metric_filter_by_gt,
-        )
-        res = {k: float(v) for k, v in res.items()}
+        print("Inference done for slice", i, pred)
+        inference_results.append((pred, slice, cfg_copy))
+        del inf
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        row = {**cfg, **res}
+    # Phase 2: parallel CPU evaluation
+    with ThreadPoolExecutor(max_workers=args.eval_workers) as executor:
+        futures = [
+            executor.submit(
+                _evaluate_slice,
+                pred, gt_slice, cfg_copy,
+                args.expression_metadata_dir,
+                args.metric_gene_set_file,
+                args.metric_sampling,
+                args.metric_filter_by_gt,
+            )
+            for pred, gt_slice, cfg_copy in inference_results
+        ]
+        eval_results = [f.result() for f in futures]
+
+    # Phase 3: serial write and artifact save
+    for (pred, gt_slice, cfg_copy), res in zip(inference_results, eval_results):
+        row = {**cfg_copy, **res}
         write_row(row, args.out_csv)
-        print("wrote", cfg)
-        # save config to artifact dir as json
+        print("wrote", cfg_copy)
 
-        # save config + results into artifact dir
-        cfg_path = os.path.join(cfg["artifact_dir"], "config.json")
+        cfg_path = os.path.join(cfg_copy["artifact_dir"], "config.json")
         with open(cfg_path, "w") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(cfg_copy, f, indent=2)
 
-        res_path = os.path.join(cfg["artifact_dir"], "results.json")
+        res_path = os.path.join(cfg_copy["artifact_dir"], "results.json")
         with open(res_path, "w") as f:
             json.dump(res, f, indent=2)
 
-        # optionally also save predictions
-        pred_path = os.path.join(cfg["artifact_dir"], "pred.pkl")
+        pred_path = os.path.join(cfg_copy["artifact_dir"], "pred.pkl")
         with open(pred_path, "wb") as f:
             pkl.dump(pred, f)
 
-        # delete all local variables and collect garbage
-        del pred, inf
-        torch.cuda.empty_cache()
-        gc.collect()
+    del inference_results, eval_results
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 if __name__ == "__main__":

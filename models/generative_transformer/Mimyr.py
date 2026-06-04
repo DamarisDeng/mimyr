@@ -138,6 +138,7 @@ class Mimyr:
         batch_size: int = 12,
         verbose: bool = False,
         fast=False,
+        select_max_index_margin: float = 0.01,
         **generate_kwargs,
     ):
         """
@@ -297,6 +298,7 @@ class Mimyr:
                             override_expr_sequence if cheat_with_expr else None
                         ),
                         verbose=verbose,
+                        select_max_index_margin=select_max_index_margin,
                         **generate_kwargs,
                     )
                 )
@@ -314,6 +316,7 @@ class Mimyr:
                             override_expr_sequence if cheat_with_expr else None
                         ),
                         verbose=verbose,
+                        select_max_index_margin=select_max_index_margin,
                         **generate_kwargs,
                     )
                 )

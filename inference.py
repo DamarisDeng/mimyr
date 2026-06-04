@@ -420,6 +420,9 @@ class Inference:
                 bin_idxs = np.digitize(vals_full, edges, right=True)
                 pred_data.obs[f"<{coord}>"] = bin_idxs
 
+            if self.config.get("omit_x", False) and "<x>" in pred_data.obs.columns:
+                del pred_data.obs["<x>"]
+
             obs = pred_data.obs.copy()
 
             if self.config["full_gene_panel"]:
@@ -428,8 +431,30 @@ class Inference:
             else:
                 var = pd.DataFrame(index=real_data.var_names)
 
-            # 3) build brand-new X as zeros, sparse
-            X_sparse = np.zeros((len(pred_data.obs_names), len(var.index)))
+            # Teacher-forcing knobs (default False => standard free-running inference).
+            # cheat_with_tokens: feed GT gene identities, model only predicts values.
+            # cheat_with_expr:   feed GT expression values too (fully teacher-forced).
+            # expression_teacher_fill: just place GT expression in adata_sub.X so the
+            #   above (or return_gt) have ground truth to read from.
+            cheat_with_tokens = bool(self.config.get("cheat_with_tokens", False))
+            cheat_with_expr = bool(self.config.get("cheat_with_expr", False))
+            teacher_fill = bool(
+                self.config.get("expression_teacher_fill", False)
+                or cheat_with_tokens
+                or cheat_with_expr
+            )
+
+            # 3) build X: zeros for free-running inference, or GT expression aligned
+            #    onto the full gene panel when teacher forcing.
+            if teacher_fill:
+                real_X = real_data.X
+                real_X = real_X.toarray() if hasattr(real_X, "toarray") else np.asarray(real_X)
+                real_df = pd.DataFrame(real_X, columns=list(real_data.var_names))
+                X_sparse = real_df.reindex(
+                    columns=list(var.index), fill_value=0.0
+                ).to_numpy(dtype=float)
+            else:
+                X_sparse = np.zeros((len(pred_data.obs_names), len(var.index)))
 
             # 4) re-create
             adata_sub = AnnData(
@@ -444,16 +469,23 @@ class Inference:
                 meta_info=meta_info,
                 use_kv_cache=True,
             )
+            # model_inference does not set bin_edges; teacher-forced GT binning needs them.
+            if teacher_fill and not hasattr(scml, "bin_edges"):
+                bin_edges = compute_global_bin_edges(
+                    adata_sub, meta_info["gene_set"], scml.n_express_level
+                )
+                scml.bin_edges = torch.tensor(bin_edges)
             results = scml.generate_cell_genesis(
                 idx=range(len(pred_data.obs_names)),
                 max_new_tokens=500,
-                top_k=5,
+                top_k=self.config.get("top_k", 5),
                 verbose=False,
                 return_gt=False,
-                batch_size=1500,  # 128,
-                cheat_with_tokens=None,
-                cheat_with_expr=None,
+                batch_size=512,
+                cheat_with_tokens=cheat_with_tokens,
+                cheat_with_expr=cheat_with_expr,
                 fast=True,
+                select_max_index_margin=self.config.get("expression_select_max_index_margin", 0.01),
             )
 
             if self.config.get("expression_verbose_eval", False):
