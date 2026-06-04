@@ -1,0 +1,48 @@
+# Bin-channel scheduled-sampling fine-tune (rq1)
+# ===============================================
+# Continues the rq1 noreweight base (the checkpoint the expr_debug diagnostic uses) with
+# scheduled sampling applied ONLY to the expression-bin feedback channel (gene tokens stay
+# teacher-forced). Targets the free-running bin/regressor collapse documented in
+# expr_debug/FINDINGS.md.
+#
+# Usage: torchrun --nproc_per_node=2 --master_port $port main.py --config configs/finetune_rq1_binss.yaml
+
+# --- Paths ---
+data_dir: /work/magroup/skrieger/tissue_generator/quantized_slices
+zhuang_data_dir: /work/magroup/skrieger/MERFISH_BICCN/processed_data
+diseased_data_dir: /work/magroup/skrieger/tissue_generator/CCF_registration/ccf_aligned_Trem2_5xFAD/cleaned_versions
+expression_metadata_dir: /work/magroup/skrieger/tissue_generator/spencer_gentran/generative_transformer/metadata
+meta_info: /work/magroup/skrieger/tissue_generator/MERFISH_aging/4hierarchy_metainfo_mouse_geneunion2_DAG.pt
+
+# --- Job settings ---
+run_mode: train
+data_mode: rq1
+device: cuda
+skip_combined_fit: true
+
+# --- Model checkpoints ---
+expression_model_checkpoint: /compute/oven-0-13/skrieger/TG-base-noreweight-slaf/epoch150_model.pt
+expression_output_dir: /compute/oven-0-13/skrieger/TG-base-noreweight-slaf-binss
+expression_from_finetuned: true
+
+# --- Training hyperparameters ---
+expression_batch_size: 128
+expression_max_len: 500
+expression_no_shuffle: false
+expression_epochs: 30
+expression_lr: 0.0005
+expression_lambda_val: 0.1
+expression_new_expression_size: 100
+expression_save_frequency: 1
+expression_xyz_noise: true
+expression_log_per_steps: 1000
+expression_verbose_eval: true
+
+# --- Bin-channel scheduled sampling ---
+# eps ramps 0 -> 0.25 over epochs after a 2-epoch teacher-forced warmup; argmax feedback
+# matches the greedy bin used at inference.
+expression_bin_ss_eps_max: 0.25
+expression_bin_ss_schedule: linear
+expression_bin_ss_warmup_epochs: 2
+expression_bin_ss_feedback: argmax
+expression_bin_ss_temp: 1.0

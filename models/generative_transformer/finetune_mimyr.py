@@ -607,6 +607,49 @@ def get_parser():
     parser.add_argument("--batch-size", type=int, default=8, help="Training batch size")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
     parser.add_argument(
+        "--ordinal-bin-sigma", dest="ordinal_bin_sigma", type=float, default=0.0,
+        help="If >0, expression-bin loss uses a Gaussian soft target over bin indices (ordinal-aware) with this std; 0 = hard cross-entropy",
+    )
+    # --- bin-channel scheduled sampling (exposure-bias fix on the expression-bin feedback) ---
+    parser.add_argument(
+        "--bin-ss-eps-max", dest="bin_ss_eps_max", type=float, default=0.0,
+        help="Max mixing prob for bin-channel scheduled sampling: fraction of generated-position "
+             "bins replaced by the model's own predicted bin (gene tokens stay teacher-forced). "
+             "0 (default) disables the feature -> training is byte-identical to plain teacher forcing.",
+    )
+    parser.add_argument(
+        "--bin-ss-schedule", dest="bin_ss_schedule", type=str, default="linear",
+        choices=["constant", "linear", "sigmoid"],
+        help="How epsilon ramps over epochs after warmup: constant=eps_max throughout; "
+             "linear=linear ramp to eps_max by the final epoch; sigmoid=inverse-sigmoid ramp.",
+    )
+    parser.add_argument(
+        "--bin-ss-warmup-epochs", dest="bin_ss_warmup_epochs", type=int, default=0,
+        help="Number of initial epochs with eps=0 (pure teacher forcing) before the ramp starts.",
+    )
+    parser.add_argument(
+        "--bin-ss-feedback", dest="bin_ss_feedback", type=str, default="argmax",
+        choices=["argmax", "sample"],
+        help="How the fed-back bin is decoded in pass 1: argmax (matches greedy inference) or "
+             "sample from softmax(logits / bin-ss-temp).",
+    )
+    parser.add_argument(
+        "--bin-ss-temp", dest="bin_ss_temp", type=float, default=1.0,
+        help="Temperature for --bin-ss-feedback sample (ignored for argmax).",
+    )
+    parser.add_argument(
+        "--lr-schedule", dest="lr_schedule", type=str, default="none", choices=["none", "cosine"],
+        help="LR schedule: 'cosine' = linear warmup then cosine decay; 'none' = constant LR",
+    )
+    parser.add_argument(
+        "--warmup-frac", dest="warmup_frac", type=float, default=0.0,
+        help="Fraction of total steps for linear LR warmup (cosine only)",
+    )
+    parser.add_argument(
+        "--min-lr-ratio", dest="min_lr_ratio", type=float, default=0.1,
+        help="Final LR as a fraction of peak LR at end of cosine schedule",
+    )
+    parser.add_argument(
         "--max-len",
         type=int,
         default=512,
@@ -776,8 +819,72 @@ def get_parser():
         action="store_true",
         help="Disable automatic mixed precision (AMP). By default AMP is enabled on CUDA.",
     )
+    parser.add_argument(
+        "--select-max-index",
+        action="store_true",
+        help="At each generation step, pick the highest-index token among top-k candidates instead of sampling.",
+    )
 
     return parser
+
+
+def _bin_ss_eps(epoch, args):
+    """Mixing probability epsilon for bin-channel scheduled sampling at this epoch (1-indexed).
+
+    Returns 0 (pure teacher forcing) when the feature is disabled or during warmup. After
+    warmup, ramps from 0 -> bin_ss_eps_max over the remaining epochs per --bin-ss-schedule.
+    """
+    eps_max = getattr(args, "bin_ss_eps_max", 0.0)
+    if eps_max <= 0.0:
+        return 0.0
+    warmup = getattr(args, "bin_ss_warmup_epochs", 0)
+    if epoch <= warmup:
+        return 0.0
+    sched = getattr(args, "bin_ss_schedule", "linear")
+    if sched == "constant":
+        return eps_max
+    # progress in (0, 1] over the post-warmup epochs
+    span = max(1, args.epochs - warmup)
+    p = min(1.0, (epoch - warmup) / span)
+    if sched == "sigmoid":
+        # inverse-sigmoid decay of the teacher-forcing rate (Bengio et al. 2015), normalized
+        # so p=0 -> ~0 and p=1 -> eps_max.
+        import math
+        k = 6.0  # steepness; ~symmetric ramp centered at p=0.5
+        s = lambda z: 1.0 / (1.0 + math.exp(-k * (z - 0.5)))
+        lo, hi = s(0.0), s(1.0)
+        return eps_max * (s(p) - lo) / (hi - lo)
+    return eps_max * p  # linear
+
+
+@torch.no_grad()
+def _make_bin_ss_input(model, input_ids, x_expr, labels, eps, feedback, temp, use_amp):
+    """Build the (partly) self-generated expression-bin input for scheduled sampling.
+
+    Pass 1: forward with GT gene tokens + GT bins to get the model's own next-bin predictions,
+    then replace a Bernoulli(eps) fraction of *generated* positions (labels != -100) with the
+    model's predicted bin. Prompt and padding positions always keep the GT bin. Gene tokens are
+    never touched. Returns x_expr unchanged when eps <= 0 (no extra forward pass).
+    """
+    if eps <= 0.0:
+        return x_expr
+    net = model.module if hasattr(model, "module") else model
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        out = net(idx=input_ids, x_expr=x_expr, return_hidden=False)
+    logits_exp_bins = out[1].float()  # (B, T, num_bins)
+    if feedback == "sample":
+        B, T, K = logits_exp_bins.shape
+        probs = F.softmax(logits_exp_bins / max(temp, 1e-6), dim=-1).reshape(-1, K)
+        pred = torch.multinomial(probs, num_samples=1).reshape(B, T)
+    else:  # argmax
+        pred = logits_exp_bins.argmax(dim=-1)  # (B, T)
+    # logits_exp_bins[:, j] predicts the bin at position j+1, so shift right to align with input.
+    cand = x_expr.clone()
+    cand[:, 1:] = pred[:, :-1]
+    # Only corrupt generated positions; keep prompt (labels == -100) and padding as GT.
+    gen_mask = labels != -100
+    flip = (torch.rand_like(x_expr, dtype=torch.float) < eps) & gen_mask
+    return torch.where(flip, cand, x_expr)
 
 
 def train(args):
@@ -864,6 +971,8 @@ def train(args):
         ckp["model_args"]["hidden_regressor"] = True
     if getattr(args, "continuous_coords", False):
         ckp["model_args"]["continuous_coords"] = True
+    if getattr(args, "ordinal_bin_sigma", 0.0):
+        ckp["model_args"]["ordinal_bin_sigma"] = args.ordinal_bin_sigma
     gptconf = MimyrConfig(**ckp["model_args"])
     print(gptconf)
     ModelClass = MimyrModel
@@ -1048,6 +1157,28 @@ def train(args):
     # 5) Optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
+    # Optional LR schedule: linear warmup then cosine decay to (min_lr_ratio * lr),
+    # stepped once per optimizer step. "none" (default) keeps the constant LR.
+    lr_schedule = getattr(args, "lr_schedule", "none")
+    scheduler = None
+    if lr_schedule == "cosine":
+        import math as _math
+        total_steps = max(1, args.epochs * len(train_loader))
+        warmup_steps = int(getattr(args, "warmup_frac", 0.0) * total_steps)
+        min_ratio = getattr(args, "min_lr_ratio", 0.1)
+
+        def _lr_lambda(step):
+            if warmup_steps > 0 and step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + _math.cos(_math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+        if rank == 0:
+            print(f"LR schedule: cosine, total_steps={total_steps}, "
+                  f"warmup_steps={warmup_steps}, min_lr={args.lr * min_ratio:.2e}")
+
     model.to(device)
     if dist.is_available() and dist.is_initialized():
         model = torch.nn.parallel.DistributedDataParallel(
@@ -1067,6 +1198,11 @@ def train(args):
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "lambda_val": args.lambda_val,
+                "bin_ss_eps_max": args.bin_ss_eps_max,
+                "bin_ss_schedule": args.bin_ss_schedule,
+                "bin_ss_warmup_epochs": args.bin_ss_warmup_epochs,
+                "bin_ss_feedback": args.bin_ss_feedback,
+                "bin_ss_temp": args.bin_ss_temp,
             },
             dir=args.output_dir,
         )
@@ -1104,6 +1240,13 @@ def train(args):
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
+        # Bin-channel scheduled sampling: fraction of generated-position bins fed back from
+        # the model's own predictions this epoch (0 = pure teacher forcing).
+        bin_ss_eps = _bin_ss_eps(epoch, args)
+        if rank == 0 and bin_ss_eps > 0.0:
+            print(f"Epoch {epoch} — bin-channel scheduled sampling eps={bin_ss_eps:.3f} "
+                  f"(feedback={args.bin_ss_feedback})")
+
         # Grab the *local* indices from the sampler, then aggregate
         local_idx = None
         if hasattr(train_loader.sampler, "get_last_indices"):
@@ -1133,6 +1276,13 @@ def train(args):
             if labels is not None:
                 labels = labels.to(device)
 
+            # Pass 1 (no-grad): build the (partly) self-generated bin input. Returns x_expr
+            # unchanged when bin_ss_eps == 0, so plain teacher forcing skips the extra forward.
+            x_expr_in = _make_bin_ss_input(
+                model, input_ids, x_expr, labels, bin_ss_eps,
+                args.bin_ss_feedback, args.bin_ss_temp, use_amp,
+            )
+
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 (
@@ -1145,7 +1295,8 @@ def train(args):
                     loss_exp_real,
                 ) = model(
                     idx=input_ids,
-                    x_expr=x_expr,
+                    x_expr=x_expr_in,
+                    x_expr_target=(x_expr if bin_ss_eps > 0.0 else None),
                     targets=labels,
                     y_expr=expr_target,
                     lambda_val=args.lambda_val,
@@ -1154,6 +1305,8 @@ def train(args):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
 
             # Single GPU→CPU sync for loss scalars (reused below to avoid a second sync)
             _loss_val     = loss.item()     if loss     is not None else 0.0
@@ -1197,6 +1350,7 @@ def train(args):
                         "train/batch_loss_cls":      _cls_val,
                         "train/batch_loss_exp_bin":  _exp_bin_val,
                         "train/batch_loss_exp_real": _exp_real_val,
+                        "train/bin_ss_eps":          bin_ss_eps,
                         "train/pearson_r": mean_r,
                         "train/f1":        mean_f1,
                         "train/precision": mean_prc,

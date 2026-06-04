@@ -125,6 +125,7 @@ class MimyrConfig:
     hidden_regressor: bool = False  # if True, regressor takes transformer hidden state instead of bin logits
     continuous_coords: bool = False  # if True, <x>/<y>/<z> use a linear projection instead of the discrete wee lookup
     coord_token_ids: list = None  # token IDs for <x>, <y>, <z>; set from tokenizer at init time
+    ordinal_bin_sigma: float = 0.0  # if >0, expression-bin loss uses a Gaussian soft target over bin indices (ordinal-aware) with this std; 0 = standard hard cross-entropy
 
 
 class MimyrModel(nn.Module):
@@ -239,8 +240,9 @@ class MimyrModel(nn.Module):
         targets=None,  # gene token IDs (B, T)
         xlen=None,
         x_prefix_len=None,
-        x_expr=None,  # binned expression labels (B, T)
+        x_expr=None,  # binned expression labels (B, T) — embedded as input
         y_expr=None,  # real-valued expression (B, T)
+        x_expr_target=None,  # optional separate bin target for the bin-CE loss; if None, uses x_expr (teacher forcing). Lets the embedded input be self-generated (scheduled sampling) while the loss target stays GT.
         lambda_val: float = 1.0,
         return_hidden=False,
     ):
@@ -392,14 +394,40 @@ class MimyrModel(nn.Module):
 
             if x_expr is not None:
                 B, T, V = logits_exp_bins.shape
-                x_expr_masked = x_expr.clone()
+                # The bin-CE target is the GT bin sequence. Under scheduled sampling the
+                # *embedded* x_expr may be (partly) self-generated, so the target is passed
+                # separately; default to x_expr to preserve plain teacher-forcing behavior.
+                bin_target = x_expr_target if x_expr_target is not None else x_expr
+                x_expr_masked = bin_target.clone()
                 x_expr_masked[targets == -100] = -100
 
                 shift_exp_logits = logits_exp_bins[:, :-1, :].reshape(-1, V)
                 shift_exp_labels = x_expr_masked[:, 1:].reshape(-1)
-                loss_exp_bin = F.cross_entropy(
-                    shift_exp_logits, shift_exp_labels, ignore_index=-100
-                )
+
+                sigma = getattr(self.config, "ordinal_bin_sigma", 0.0)
+                if sigma and sigma > 0.0:
+                    # Ordinal-aware bin loss: instead of a one-hot target (which treats
+                    # bins as independent classes), use a Gaussian soft target centered
+                    # on the true bin index. Predicting an adjacent bin is then penalized
+                    # far less than a distant one. sigma -> 0 recovers hard cross-entropy.
+                    # (Soft ordinal labels; cf. Diaz & Marathe, CVPR 2019.)
+                    valid = shift_exp_labels != -100
+                    if valid.any():
+                        logits_v = shift_exp_logits[valid]            # (M, K)
+                        labels_v = shift_exp_labels[valid].float()    # (M,)
+                        bins = torch.arange(V, device=logits_v.device, dtype=torch.float)  # (K,)
+                        soft_target = F.softmax(
+                            -((bins.unsqueeze(0) - labels_v.unsqueeze(1)) ** 2) / (2.0 * sigma * sigma),
+                            dim=-1,
+                        )  # (M, K)
+                        log_probs = F.log_softmax(logits_v, dim=-1)   # (M, K)
+                        loss_exp_bin = -(soft_target * log_probs).sum(dim=-1).mean()
+                    else:
+                        loss_exp_bin = shift_exp_logits.sum() * 0.0   # no valid tokens; keep graph
+                else:
+                    loss_exp_bin = F.cross_entropy(
+                        shift_exp_logits, shift_exp_labels, ignore_index=-100
+                    )
 
             loss_exp_real = None
             if y_expr is not None:
