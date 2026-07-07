@@ -303,18 +303,14 @@ def intersect_and_filter_X(gt_adata, pred_adata, min_expr_cells=0, gene_set=None
     if len(common_genes) == 0:
         raise ValueError("No overlapping genes between gt_adata and pred_adata.")
 
-    # 2) if gene_set is provided, restrict to those genes within common_genes
+    # 2) if a gene_set is provided, restrict to those genes within common_genes.
+    #    NB: this only narrows the candidate genes -- the expression filter below
+    #    (including filter_by_gt) still runs, so --metric_filter_by_gt is honored
+    #    whether or not a gene_set was supplied.
     if gene_set is not None:
-        kept_genes = common_genes.intersection(np.asarray(gene_set))
-        if len(kept_genes) == 0:
+        common_genes = common_genes.intersection(np.asarray(gene_set))
+        if len(common_genes) == 0:
             raise ValueError("No genes in gene_set overlap with common genes.")
-        gt_X_filtered = gt_adata[:, kept_genes].X
-        pred_X_filtered = pred_adata[:, kept_genes].X
-        if sp.issparse(gt_X_filtered):
-            gt_X_filtered = gt_X_filtered.todense()
-        if sp.issparse(pred_X_filtered):
-            pred_X_filtered = pred_X_filtered.todense()
-        return gt_X_filtered.tolist(), pred_X_filtered.tolist(), kept_genes
 
     gt_common = gt_adata[:, common_genes]
     pred_common = pred_adata[:, common_genes]
