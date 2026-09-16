@@ -108,7 +108,8 @@ class SliceDataLoader:
     ):
         """
         Args:
-            mode (str): data mode — one of rq1, rq2, rq2_v2, rq3, rq3_v2, rq3_v2_d*, rq4, rq5
+            mode (str): data mode — one of rq1, rq2, rq2_v2, rq3, rq3_v2, rq3_v2_d*,
+                rq3_v2_cheat, rq4, rq4_rq3, rq4_noref, rq5, base_zhuang1
             label (str): obs column to use as the cell-type label
             cfg (dict): full config dict (from argparse); must include data_dir and,
                 for Zhuang-based modes, zhuang_data_dir; for rq5, diseased_data_dir
@@ -423,6 +424,11 @@ class SliceDataLoader:
         self.val_slices = val_slices
         self.test_slices = test_slices
         self.reference_slices = reference_slices
+        # Most modes pair each test slice with exactly two bracketing reference
+        # slices, consumed positionally as reference_slices[2*i:2*i+2] in main.py.
+        # Modes that instead expose one whole-brain reference pool shared by every
+        # test slice set this True; main.py then hands the full list through.
+        self.fixed_reference_pool = False
         self.fine_tune_train_slices = None
         self.fine_tune_val_slices = None
         self.fine_tune_test_slices = None
@@ -856,13 +862,36 @@ class SliceDataLoader:
             slices_tokenized = self._align_and_tokenize_slices(slices)
 
             test_indices = [1, 10, 20, 30, 40]
-            val_indices = [44]
 
             test_slices = [slices_tokenized[i] for i in test_indices]
+
+            # Each test slice T gets a symmetric reference bracket [T-d, T+d]
+            # (one slice below, one above), flattened in test-slice order so the
+            # positional pairing in main.py (reference_slices[2*i:2*i+2]) hands
+            # each test slice its below/above pair. The lower index is clamped to
+            # 0 for the edge test slice (T=1), which has no slice far enough
+            # below it. This is the d5 structure of rq3_v2 generalized to d<5.
+            def _pair(T):
+                return [max(0, T - d), T + d]
+
+            ref_indices = (
+                _pair(1) + _pair(10) + _pair(20) + _pair(30) + _pair(40)
+            )
+
+            # Hold out the topmost reference slice as validation (mirrors rq3_v2,
+            # where the top reference index doubles as the val slice), and train
+            # on every other distinct reference slice.
+            val_index = 40 + d
+            val_indices = [val_index]
             val_slices = [slices_tokenized[i] for i in val_indices]
 
-            # d-offset indices are always used for reference slices
-            train_indices = [10 - d, 20 - d, 30 - d, 40 - d]
+            train_indices = []
+            _seen = set()
+            for _idx in ref_indices:
+                if _idx == val_index or _idx in _seen:
+                    continue
+                _seen.add(_idx)
+                train_indices.append(_idx)
 
             train_slices = [slices_tokenized[i] for i in train_indices]
 
@@ -900,13 +929,6 @@ class SliceDataLoader:
                 train_slices.extend(rq1_slices_tokenized)
 
 
-            ref_indices = (
-                [train_indices[0]] * 3
-                + [train_indices[1]] * 2
-                + [train_indices[2]] * 2
-                + [train_indices[3]] * 2
-                + [44]
-            )
             reference_slices = [slices_tokenized[i] for i in ref_indices]
 
             train_slices, val_slices, test_slices, reference_slices = (
@@ -1001,6 +1023,65 @@ class SliceDataLoader:
             self._set_slice_attributes(
                 train_slices, val_slices, test_slices, reference_slices
             )
+
+        elif self.mode == "rq4_noref":
+            # "No-reference" rq4: same held-out Zhuang-ABCA-3 sagittal test sections
+            # as rq4, but the weak-teacher-forcing references come from a *different
+            # brain*, Zhuang-ABCA-1, which was sectioned coronally. Nothing from the
+            # rq4 brain is used at inference time.
+            #
+            # The orientation difference needs no special handling: both datasets
+            # carry Allen CCF coordinates, and aligned_spatial is stacked as
+            # [z_ccf, y_ccf, x_ccf] for both (see _align_and_tokenize_slices). Taken
+            # together the 129 coronal Zhuang-1 sections are a dense 3-D point cloud
+            # of a whole brain (~0.09 mm section spacing in x_ccf, dense in-plane),
+            # so a sagittal query plane simply cuts through it and the existing 3-D
+            # per-cell-type KDTree lookup in Inference._build_lookup_prior finds the
+            # geometrically nearest same-type cell. The rq4 test sections sit at
+            # z_ccf ~ 5.11 / 4.54 / 3.26 / 2.51 / 1.62, all inside Zhuang-1's z_ccf
+            # coverage [0.51, 5.87].
+            #
+            # Tokenize the Zhuang-1 pool first so self.gene_exp_model ends up holding
+            # the Zhuang-3 model, matching plain rq4 (inference.py reads it for
+            # get_label_from_token). Cross-dataset token agreement relies on
+            # GeneExpModel loading the global data/id_to_subclass.pkl -- its except
+            # branch silently re-enumerates, which would make the two datasets'
+            # tokens disagree, so assert the maps match.
+            reference_slices = self._align_and_tokenize_slices(
+                self.load_zhuangn_slices(n=1)
+            )
+            ref_token_map = dict(self.gene_exp_model.subclass_to_id)
+
+            slices = self.load_zhuangn_slices(n=3, remove_edges=False)
+            slices_tokenized = self._align_and_tokenize_slices(slices)
+            if self.gene_exp_model.subclass_to_id != ref_token_map:
+                raise RuntimeError(
+                    "rq4_noref: cell-type token maps diverged between Zhuang-1 and "
+                    "Zhuang-3 -- data/id_to_subclass.pkl failed to load, so tokens "
+                    "were re-enumerated per dataset and the cross-brain lookup would "
+                    "match the wrong cell types."
+                )
+
+            # Same held-out sections as rq4. train/val are unused at inference but
+            # _build_adata indexes train_slices[0], so they must stay non-empty.
+            test_indices = [2, 5, 11, 14, 18]
+            val_indices = [7]
+            train_indices = [0, 3, 12, 17]
+
+            test_slices = [slices_tokenized[i] for i in test_indices]
+            val_slices = [slices_tokenized[i] for i in val_indices]
+            train_slices = [slices_tokenized[i] for i in train_indices]
+
+            train_slices, val_slices, test_slices, reference_slices = (
+                self._harmonize_slice_lists(
+                    train_slices, val_slices, test_slices, reference_slices
+                )
+            )
+            self._set_slice_attributes(
+                train_slices, val_slices, test_slices, reference_slices
+            )
+            # Whole-brain pool shared by every test slice, not a per-slice bracket.
+            self.fixed_reference_pool = True
 
         elif self.mode == "rq5":
             slices = self.load_diseased_slices()

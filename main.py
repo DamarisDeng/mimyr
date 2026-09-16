@@ -8,6 +8,7 @@ import yaml
 
 from models.combined_model import CombinedModel
 from data_loader import SliceDataLoader
+from data_modes import is_sagittal_mode
 from models.biological_model import KDEModelForGuidance
 import torch
 import numpy as np
@@ -142,8 +143,14 @@ def get_args():
     parser.add_argument(
         "--guidance_signal",
         type=float,
-        default=0.01,
-        help="Guidance signal for classifier-based guidance",
+        default=0.0,
+        help="Backward-guidance strength (eta) for location diffusion: scales the "
+             "gradient of the neighbouring-slice KDE that is added at each reverse "
+             "step. 0 = no guidance (plain plane-conditioned sampling). Default is "
+             "0 so that runs which do not ask for guidance keep the unguided "
+             "behaviour every result before 2026-07 was produced with; note rows "
+             "recorded before this default changed show 0.01 but were also unguided, "
+             "because the guided sampler had no caller.",
     )
 
     parser.add_argument(
@@ -281,6 +288,12 @@ def get_args():
         help="Add noise to x,y,z coordinates during expression model training",
     )
     parser.add_argument(
+        "--expression_xyz_noise_magnitude", type=int, default=2,
+        help="Half-width m of the uniform discrete coordinate noise drawn from {-m..+m} "
+             "when --expression_xyz_noise is set. 2 (default) reproduces the historical "
+             "hard-coded {-2..2}; 0 makes the flag a no-op.",
+    )
+    parser.add_argument(
         "--expression_dropout", type=float, default=None,
         help="Override checkpoint dropout value (e.g. 0.0 to disable dropout during finetuning)",
     )
@@ -341,6 +354,75 @@ def get_args():
     parser.add_argument(
         "--top_k", type=int, default=5,
         help="Top-k sampling for expression model generation",
+    )
+    # --- weak teacher forcing from the spatial-lookup cell (inference-time only) ---
+    parser.add_argument(
+        "--expression_weak_teacher_forcing", action="store_true",
+        help="Softly steer free-running expression generation toward the nearest "
+             "same-cell-type reference (lookup) cell via logit biasing. Master "
+             "switch; OFF is byte-identical to standard inference.",
+    )
+    parser.add_argument(
+        "--wtf_alpha_gene", type=float, default=0.0,
+        help="Logit bias added to gene-token logits the lookup prior expresses "
+             "(weak teacher forcing). 0 = no gene-presence steering.",
+    )
+    parser.add_argument(
+        "--wtf_alpha_bin", type=float, default=0.0,
+        help="Logit bias added to the lookup prior's expression bin (weak teacher "
+             "forcing). 0 = no bin steering.",
+    )
+    parser.add_argument(
+        "--wtf_bin_sigma", type=float, default=0.0,
+        help="If >0, the bin bias is an ordinal-aware Gaussian over bin indices "
+             "(std = sigma) centered on the prior bin; 0 = single-bin spike.",
+    )
+    parser.add_argument(
+        "--wtf_unexpressed_mode", type=str, default="none", choices=["none", "low"],
+        help="How weak teacher forcing treats genes the prior does not express: "
+             "'none' = no bias; 'low' = bias toward bin 0.",
+    )
+    parser.add_argument(
+        "--ref_slab", type=float, default=None,
+        help="If set, restrict the reference pool to cells within this distance (CCF "
+             "mm) of the test slice along the section axis before building the "
+             "nearest-neighbour KDTrees. Intended for whole-brain pools (rq4_noref) "
+             "where the full pool is ~2.6M cells; trades KDTree build/query time "
+             "against coverage of rare cell types. Default None = use the full pool.",
+    )
+    # --- tunable reference guidance: 0 = ignore reference .. 100 = exact override ---
+    parser.add_argument(
+        "--wtf_strength_gene", type=float, default=0.0,
+        help="Reference-guidance strength for gene presence in [0,100]. Mixes the "
+             "next-gene distribution toward the reference's genes in probability "
+             "space; 0 = ignore, 100 = emit exactly the reference gene set.",
+    )
+    parser.add_argument(
+        "--wtf_strength_bin", type=float, default=0.0,
+        help="Reference-guidance strength for the expression bin in [0,100]. "
+             "0 = ignore, 100 = use the reference's bin for each chosen gene.",
+    )
+    parser.add_argument(
+        "--wtf_strength_value", type=float, default=0.0,
+        help="Reference-guidance strength for the real expression magnitude in "
+             "[0,100]. Blends the regressor value toward the reference's "
+             "(normalized + log1p) expression; 0 = ignore, 100 = use it directly. "
+             "This is the knob that moves mean/variance of log expression and "
+             "library size.",
+    )
+    # --- cell-type sampling: fight mode collapse / restore local heterogeneity ---
+    parser.add_argument(
+        "--cluster_temperature", type=float, default=1.0,
+        help="Softmax temperature applied to the cell-type logits before sampling "
+             "(cluster_inference_type=model). >1 flattens overconfident distributions "
+             "so sampling surfaces non-modal types; 1.0 = unchanged.",
+    )
+    parser.add_argument(
+        "--cluster_prior_alpha", type=float, default=0.0,
+        help="Long-tail logit-adjustment strength for cell-type sampling: subtract "
+             "alpha*log(prior) from the logits, where prior is the class-frequency "
+             "marginal of the reference slices. Boosts rare cell types toward their "
+             "reference abundance. 0 = off (no adjustment), 1 = full prior removal.",
     )
     parser.add_argument(
         "--expression_ordinal_bin_sigma", type=float, default=0.0,
@@ -505,7 +587,10 @@ def main():
 
         expr_args = _argparse.Namespace(
             # paths / identity
-            ckp_path=args.expression_model_checkpoint,
+            # An EMPTY --expression_model_checkpoint means "train from scratch": the
+            # flag's argparse default is a real path, so without this coercion
+            # --expression_model_size could never take effect (ckp_path was never None).
+            ckp_path=args.expression_model_checkpoint or None,
             meta_info=os.path.join(args.data_dir, args.meta_info),
             output_dir=args.expression_output_dir,
             # data
@@ -527,6 +612,7 @@ def main():
             num_workers=4,
             save_frequency=args.expression_save_frequency,
             xyz_noise=args.expression_xyz_noise,
+            xyz_noise_magnitude=getattr(args, "expression_xyz_noise_magnitude", 2),
             epoch_samples=args.expression_epoch_samples,
             seed=42,
             log_per_steps=args.expression_log_per_steps,
@@ -581,27 +667,54 @@ def main():
 
         slice_data_loader.test_slices = [slice]
 
-        slice_data_loader.reference_slices = temp_ref_slices[
-            2 * i : 2 * i + 2
-        ]
-        if len(slice_data_loader.reference_slices) == 0:
-            slice_data_loader.reference_slices = temp_ref_slices[-2:]
+        fixed_pool = getattr(slice_data_loader, "fixed_reference_pool", False)
+        if fixed_pool:
+            # One whole-brain reference pool shared by every test slice (rq4_noref):
+            # hand the full list through instead of the usual per-slice bracket.
+            slice_data_loader.reference_slices = temp_ref_slices
+        else:
+            slice_data_loader.reference_slices = temp_ref_slices[
+                2 * i : 2 * i + 2
+            ]
+            if len(slice_data_loader.reference_slices) == 0:
+                slice_data_loader.reference_slices = temp_ref_slices[-2:]
 
         cfg_copy["slice_index"] = i
 
-        closest_ref_slice = np.argsort(
-            [
-                np.square(
-                    ref_slice.obsm["aligned_spatial"].mean(0)[-1]
-                    - slice_data_loader.test_slices[0]
-                    .obsm["aligned_spatial"]
-                    .mean(0)[-1]
+        if fixed_pool:
+            # "Closest reference slice" is meaningless for a whole-brain pool drawn
+            # from a differently-sectioned brain, so there is no honest KDE to build
+            # here. The object is still constructed because Inference takes one, but
+            # at guidance_signal == 0 sample_with_guidance short-circuits to sample()
+            # and never queries it. Refuse rather than silently guide on nonsense.
+            if args.guidance_signal != 0.0:
+                raise ValueError(
+                    f"--guidance_signal must be 0 with data_mode={args.data_mode} "
+                    "(fixed reference pool): there is no single neighbouring slice to "
+                    "build the backward-guidance KDE from."
                 )
-                for ref_slice in slice_data_loader.reference_slices
-            ]
-        )[1]
-        best_ref_slice = slice_data_loader.reference_slices[closest_ref_slice].copy()
-        if args.data_mode == "rq4":
+            pool_ref = slice_data_loader.reference_slices[0]
+            n_sub = min(50_000, pool_ref.n_obs)
+            best_ref_slice = pool_ref[
+                np.random.choice(pool_ref.n_obs, size=n_sub, replace=False)
+            ].copy()
+        else:
+            closest_ref_slice = np.argsort(
+                [
+                    np.square(
+                        ref_slice.obsm["aligned_spatial"].mean(0)[-1]
+                        - slice_data_loader.test_slices[0]
+                        .obsm["aligned_spatial"]
+                        .mean(0)[-1]
+                    )
+                    for ref_slice in slice_data_loader.reference_slices
+                ]
+            )[1]
+            best_ref_slice = slice_data_loader.reference_slices[
+                closest_ref_slice
+            ].copy()
+
+        if is_sagittal_mode(args.data_mode):
             best_ref_slice.obsm["aligned_spatial"][:, 0] = (
                 slice_data_loader.test_slices[0].obsm["aligned_spatial"][:, 0].mean(0)
             )

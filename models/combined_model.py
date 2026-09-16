@@ -26,7 +26,12 @@ class TrainConfig:
     epochs: int = 1000000
     grad_clip: float = None
     ema_decay: float = 0.999
-    
+    # checkpoint basename prefix (epoch appended). Override for a retrain so it
+    # doesn't clobber the production smoothtune_..._400.pt checkpoint.
+    ckpt_prefix: str = "smoothtune2_conditional_ddpm_2d_checkpoint"
+    # whether train() renders the in-loop 200k-point sample figures (headless: off).
+    viz: bool = True
+
 class CombinedModel:
     def __init__(self, location_model_checkpoint=None, celltype_model_checkpoint=None, gene_exp_model_checkpoint=None):
 

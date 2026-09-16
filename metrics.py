@@ -99,6 +99,187 @@ def soft_accuracy(
     return np.mean(result) if result else 0.0
 
 
+def celltype_abundance_metrics(gt_tokens, pred_tokens, rare_frac=0.5):
+    """Global cell-type abundance fidelity, with emphasis on the long tail.
+
+    soft_accuracy / soft_spearman are dominated by the common classes (L2-norm +
+    cosine), so they barely move when rare cell types collapse. These metrics
+    target exactly that: does a rare type still appear at ~the right abundance?
+
+    Returns a dict:
+      tvd_all         : total-variation distance between gt and pred class
+                        frequencies over ALL classes. 0 = identical, lower better.
+      rare_tvd        : TVD restricted to GT-rare classes (bottom `rare_frac` of
+                        GT-present classes by frequency). 0 = identical, lower better.
+      rare_mass_ratio : (pred mass on GT-rare classes) / (gt mass on them). The
+                        single most interpretable "do rare types appear at similar
+                        abundance" number: 1.0 = matched, <1 = rare types under-
+                        represented (the collapse signature), >1 = over-represented.
+    """
+    gt_tokens = np.asarray(gt_tokens).astype(int)
+    pred_tokens = np.asarray(pred_tokens).astype(int)
+    C = int(max(gt_tokens.max(), pred_tokens.max())) + 1
+
+    gt_freq = np.bincount(gt_tokens, minlength=C).astype(np.float64)
+    gt_freq /= gt_freq.sum()
+    pred_freq = np.bincount(pred_tokens, minlength=C).astype(np.float64)
+    pred_freq /= pred_freq.sum()
+
+    tvd_all = float(0.5 * np.abs(gt_freq - pred_freq).sum())
+
+    present = np.where(gt_freq > 0)[0]  # classes that actually occur in GT
+    # rare = bottom `rare_frac` of GT-present classes by frequency
+    cutoff = np.quantile(gt_freq[present], rare_frac)
+    rare = present[gt_freq[present] <= cutoff]
+    if len(rare) > 0:
+        rare_tvd = float(0.5 * np.abs(gt_freq[rare] - pred_freq[rare]).sum())
+        gt_rare_mass = gt_freq[rare].sum()
+        rare_mass_ratio = float(pred_freq[rare].sum() / gt_rare_mass) if gt_rare_mass > 0 else 0.0
+    else:
+        rare_tvd = 0.0
+        rare_mass_ratio = 1.0
+
+    return {
+        "tvd_all": tvd_all,
+        "rare_tvd": rare_tvd,
+        "rare_mass_ratio": rare_mass_ratio,
+    }
+
+
+def local_composition_entropy(gt_tokens, gt_positions, pred_tokens, pred_positions,
+                              radius=0.05, sample=None):
+    """Per-neighborhood cell-type diversity match.
+
+    For each sample point, compare the Shannon entropy of the local cell-type
+    composition (neighbors within `radius`) between GT and prediction. Mode
+    collapse shows up as prediction entropy systematically BELOW GT entropy.
+
+    Returns a dict:
+      entropy_mae  : mean |H(gt nbhd) - H(pred nbhd)|, nats. 0 = identical diversity.
+      entropy_bias : mean (H(pred) - H(gt)). Negative => predictions are less
+                     diverse than GT (the collapse signature); ~0 = right diversity.
+    """
+    gt_tokens = np.asarray(gt_tokens).astype(int)
+    pred_tokens = np.asarray(pred_tokens).astype(int)
+    gt_positions = np.asarray(gt_positions)
+    pred_positions = np.asarray(pred_positions)
+
+    gt_tree = cKDTree(gt_positions)
+    pred_tree = cKDTree(pred_positions)
+
+    if sample is not None:
+        n = int(len(gt_positions) * sample / 100)
+        idx = np.random.choice(len(gt_positions), size=n, replace=False)
+        samples = gt_positions[idx]
+    else:
+        samples = gt_positions
+
+    gt_nbrs = gt_tree.query_ball_point(samples, radius, workers=-1)
+    pred_nbrs = pred_tree.query_ball_point(samples, radius, workers=-1)
+
+    def _entropy(tokens):
+        if len(tokens) == 0:
+            return None
+        counts = np.bincount(tokens)
+        p = counts[counts > 0] / counts.sum()
+        return float(-(p * np.log(p)).sum())
+
+    abs_diffs, signed_diffs = [], []
+    for gn, pn in zip(gt_nbrs, pred_nbrs):
+        hg = _entropy(gt_tokens[gn])
+        hp = _entropy(pred_tokens[pn])
+        if hg is None or hp is None:
+            continue
+        abs_diffs.append(abs(hp - hg))
+        signed_diffs.append(hp - hg)
+
+    return {
+        "entropy_mae": float(np.mean(abs_diffs)) if abs_diffs else 0.0,
+        "entropy_bias": float(np.mean(signed_diffs)) if signed_diffs else 0.0,
+    }
+
+
+
+def composition_pairwise(gt_tokens, gt_positions, pred_tokens, pred_positions,
+                         radius=0.05, rare_frac=0.5, sample=None, n_strata=4, seed=0):
+    """PAIRWISE (same-location) rare-cell-type fidelity.
+
+    The global rare_mass_ratio / tvd_all can look fine even if the model sprinkles
+    rare types at a ~uniform base rate everywhere, while GT concentrates them in
+    specific high-heterogeneity regions -- the two just have to agree on AVERAGE.
+    This instead compares, at each sample location, the rare-cell FRACTION of the
+    GT neighborhood vs the SAME location's PREDICTED neighborhood (1-to-1).
+
+    "rare" = the bottom `rare_frac` of GT-present classes by global frequency.
+
+    Returns a dict:
+      rare_frac_pearson  : Pearson corr of (gt_rare_frac, pred_rare_frac) across
+                           matched neighborhoods. LOW => rare cells are in the wrong
+                           places (uniform base level), even if global abundance matches.
+      rare_frac_spearman : rank version of the above.
+      rare_frac_mae      : mean |gt_rare_frac - pred_rare_frac| per neighborhood.
+      strata_gt / strata_pred : mean gt/pred rare-fraction within quartiles of
+                           gt_rare_frac (low->high heterogeneity). If strata_pred is
+                           ~flat while strata_gt rises, the model is NOT tracking the
+                           spatial heterogeneity structure (the uniform-base failure).
+    """
+    gt_tokens = np.asarray(gt_tokens).astype(int)
+    pred_tokens = np.asarray(pred_tokens).astype(int)
+    gt_positions = np.asarray(gt_positions)
+    pred_positions = np.asarray(pred_positions)
+
+    # rare set from GT global frequency
+    C = int(max(gt_tokens.max(), pred_tokens.max())) + 1
+    gt_freq = np.bincount(gt_tokens, minlength=C).astype(np.float64)
+    gt_freq /= gt_freq.sum()
+    present = np.where(gt_freq > 0)[0]
+    cutoff = np.quantile(gt_freq[present], rare_frac)
+    rare_mask = np.zeros(C, dtype=bool)
+    rare_mask[present[gt_freq[present] <= cutoff]] = True
+    gt_is_rare = rare_mask[gt_tokens]
+    pred_is_rare = rare_mask[pred_tokens]
+
+    gt_tree = cKDTree(gt_positions)
+    pred_tree = cKDTree(pred_positions)
+
+    if sample is not None:
+        rng = np.random.default_rng(seed)
+        n = int(len(gt_positions) * sample / 100)
+        idx = rng.choice(len(gt_positions), size=n, replace=False)
+        samples = gt_positions[idx]
+    else:
+        samples = gt_positions
+
+    gt_nbrs = gt_tree.query_ball_point(samples, radius, workers=-1)
+    pred_nbrs = pred_tree.query_ball_point(samples, radius, workers=-1)
+
+    gt_rf, pred_rf = [], []
+    for gn, pn in zip(gt_nbrs, pred_nbrs):
+        if len(gn) == 0 or len(pn) == 0:
+            continue  # need both sides populated to compare 1-to-1
+        gt_rf.append(gt_is_rare[gn].mean())
+        pred_rf.append(pred_is_rare[pn].mean())
+    gt_rf = np.asarray(gt_rf)
+    pred_rf = np.asarray(pred_rf)
+
+    out = {"rare_frac_pearson": 0.0, "rare_frac_spearman": 0.0,
+           "rare_frac_mae": 0.0, "strata_gt": [], "strata_pred": []}
+    if len(gt_rf) < 2:
+        return out
+    out["rare_frac_mae"] = float(np.abs(gt_rf - pred_rf).mean())
+    if gt_rf.std() > 0 and pred_rf.std() > 0:
+        out["rare_frac_pearson"] = float(pearsonr(gt_rf, pred_rf)[0])
+        out["rare_frac_spearman"] = float(spearmanr(gt_rf, pred_rf).correlation)
+
+    # heterogeneity strata: quantile bins of gt_rare_frac
+    edges = np.quantile(gt_rf, np.linspace(0, 1, n_strata + 1))
+    edges[-1] = np.inf
+    bins = np.digitize(gt_rf, edges[1:-1])
+    for b in range(n_strata):
+        m = bins == b
+        out["strata_gt"].append(float(gt_rf[m].mean()) if m.any() else float("nan"))
+        out["strata_pred"].append(float(pred_rf[m].mean()) if m.any() else float("nan"))
+    return out
 
 
 def delauney_colocalization(

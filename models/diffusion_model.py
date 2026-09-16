@@ -52,6 +52,12 @@ class TrainConfig:
     epochs: int = 200
     grad_clip: float = None
     ema_decay: float = 0.999
+    # checkpoint basename prefix (epoch is appended). Override to avoid clobbering
+    # other DDPM checkpoints, e.g. a Zhuang-1 location retrain.
+    ckpt_prefix: str = "smoothtune2_conditional_ddpm_2d_checkpoint"
+    # whether train() renders the in-loop 200k-point sample figures. Off = much
+    # faster headless training (the figures were never saved to disk anyway).
+    viz: bool = True
 
 
 # ---------------- Timestep embedding ----------------
@@ -400,7 +406,7 @@ class DDPMTrainer:
             print(f"Epoch {epoch:03d} | loss {avg_loss:.6f}")
 
             if epoch % 5 == 0:
-                ckpt_name = f"model_checkpoints/smoothtune2_conditional_ddpm_2d_checkpoint_{epoch}.pt"
+                ckpt_name = f"model_checkpoints/{self.cfg.ckpt_prefix}_{epoch}.pt"
                 if epoch % 20 == 0:
                     torch.save(
                         {
@@ -416,33 +422,34 @@ class DDPMTrainer:
                         ckpt_name,
                     )
 
-                # ---- generate and log a figure ----
-                # Use fixed plane at z=7: point=(0,0,7), normal=(0,0,1)
-                plane_z7 = np.array([3.0, 4.0, 6.7, 0.0, 0.0, 1.0], dtype=np.float32)
-                samples = self.sample(
-                    200000,
-                    use_ema=False,
-                    cond_vec=plane_z7,
-                )
-                plt.figure()
-                plt.scatter(samples[:, 0], samples[:, 1], s=0.01, alpha=0.5)
-                plt.xlim(0, 12)
-                plt.ylim(0, 8)
-                plt.title(f"Generated 2D samples at epoch {epoch} (z=7 plane)")
-                plt.close()
+                # ---- generate and log a figure (headless runs skip this) ----
+                if getattr(self.cfg, "viz", True):
+                    # Use fixed plane at z=7: point=(0,0,7), normal=(0,0,1)
+                    plane_z7 = np.array([3.0, 4.0, 6.7, 0.0, 0.0, 1.0], dtype=np.float32)
+                    samples = self.sample(
+                        200000,
+                        use_ema=False,
+                        cond_vec=plane_z7,
+                    )
+                    plt.figure()
+                    plt.scatter(samples[:, 0], samples[:, 1], s=0.01, alpha=0.5)
+                    plt.xlim(0, 12)
+                    plt.ylim(0, 8)
+                    plt.title(f"Generated 2D samples at epoch {epoch} (z=7 plane)")
+                    plt.close()
 
-                plane_z7 = np.array([5.0, 4.0, 7.0, 1.0, 0.0, 0.0], dtype=np.float32)
-                samples = self.sample(
-                    200000,
-                    use_ema=False,
-                    cond_vec=plane_z7,
-                )
-                plt.figure()
-                plt.scatter(samples[:, 0], samples[:, 1], s=0.01, alpha=0.5)
-                plt.xlim(0, 12)
-                plt.ylim(0, 8)
-                plt.title(f"Generated 2D samples at epoch {epoch} (z=7 plane)")
-                plt.close()
+                    plane_z7 = np.array([5.0, 4.0, 7.0, 1.0, 0.0, 0.0], dtype=np.float32)
+                    samples = self.sample(
+                        200000,
+                        use_ema=False,
+                        cond_vec=plane_z7,
+                    )
+                    plt.figure()
+                    plt.scatter(samples[:, 0], samples[:, 1], s=0.01, alpha=0.5)
+                    plt.xlim(0, 12)
+                    plt.ylim(0, 8)
+                    plt.title(f"Generated 2D samples at epoch {epoch} (z=7 plane)")
+                    plt.close()
 
     @torch.no_grad()
     def sample(
@@ -528,6 +535,20 @@ class DDPMTrainer:
         guidance_scale: multiplier on gradient of potential.
         cond_vec: conditioning vector (unnormalized)
         """
+        # guidance_scale == 0 means "no guidance": delegate to the plain sampler
+        # rather than multiplying the potential gradient by zero. Two reasons:
+        # the unguided path stays bit-for-bit what it was before guidance was
+        # re-wired (same RNG draw order -- sample() draws z before the model
+        # forward, this function draws it after), and a non-finite KDE gradient
+        # can't poison the result via 0 * inf = nan.
+        if not guidance_scale or potential_model is None:
+            return self.sample(
+                n_samples,
+                use_ema=use_ema,
+                cond_vec=cond_vec,
+                small_t_threshold=small_t_threshold,
+            )
+
         # restore model with EMA
         model = NoisePredictor(
             input_dim=2,

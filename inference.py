@@ -11,6 +11,9 @@ from sklearn.neighbors import NearestNeighbors
 from metrics import *
 from analysis import *
 
+# after the star imports so neither can shadow these
+from data_modes import is_sagittal_mode, section_axis
+
 from models.generative_transformer.Mimyr import (
     compute_global_bin_edges,
     generate_prompt_for_cg,
@@ -35,10 +38,12 @@ class Inference:
         if loc_type == "model":
 
             if self.config["data_mode"] == "rq2":
-                xyz = self.location_model[0].sample(
+                xyz = self.location_model[0].sample_with_guidance(
                     self.slice_data_loader.train_slices[0].n_obs * 3,
-                    False,
-                    np.array(
+                    self.location_model[1],
+                    guidance_scale=self.config["guidance_signal"],
+                    use_ema=False,
+                    cond_vec=np.array(
                         [
                             [
                                 4,
@@ -61,10 +66,12 @@ class Inference:
                 ][: len(new_tissue)]
 
             elif self.config["data_mode"] == "rq3":
-                xyz = self.location_model[0].sample(
+                xyz = self.location_model[0].sample_with_guidance(
                     int(adata.n_obs * 2.5),
-                    False,
-                    np.array(
+                    self.location_model[1],
+                    guidance_scale=self.config["guidance_signal"],
+                    use_ema=False,
+                    cond_vec=np.array(
                         [
                             [
                                 4,
@@ -88,11 +95,19 @@ class Inference:
                     & (xyz[:, 0] < new_tissue.obsm["aligned_spatial"].max(0)[0])
                 ]
 
-            elif self.config["data_mode"] == "rq4":
-                xyz = self.location_model[0].sample(
+            elif is_sagittal_mode(self.config["data_mode"]):
+                # NOTE: for rq4 main.py builds the KDE from a 3-D slice
+                # (aligned_spatial keeps all three columns), while the diffusion
+                # sampler works in 2-D -- so a *guided* rq4 run would hit a
+                # dimension mismatch in potential_model(). Unguided rq4
+                # (guidance_signal=0, the default) short-circuits to sample()
+                # and is unaffected. Left as-is: no rq4 guided run to test against.
+                xyz = self.location_model[0].sample_with_guidance(
                     adata.n_obs * 2,
-                    False,
-                    np.array(
+                    self.location_model[1],
+                    guidance_scale=self.config["guidance_signal"],
+                    use_ema=False,
+                    cond_vec=np.array(
                         [
                             [
                                 new_tissue.obsm["aligned_spatial"].mean(0)[0],
@@ -120,10 +135,12 @@ class Inference:
                 ]
 
             else:
-                xyz = self.location_model[0].sample(
+                xyz = self.location_model[0].sample_with_guidance(
                     adata.n_obs,
-                    False,
-                    np.array(
+                    self.location_model[1],
+                    guidance_scale=self.config["guidance_signal"],
+                    use_ema=False,
+                    cond_vec=np.array(
                         [
                             [
                                 4,
@@ -185,10 +202,8 @@ class Inference:
                 .obsm["aligned_spatial"]
                 .copy()
             )
-            if self.config["data_mode"] == "rq4":
-                xyz[:, 0] = new_tissue.obsm["aligned_spatial"].mean(0)[0]
-            else:
-                xyz[:, -1] = new_tissue.obsm["aligned_spatial"].mean(0)[-1]
+            ax = section_axis(self.config["data_mode"])
+            xyz[:, ax] = new_tissue.obsm["aligned_spatial"].mean(0)[ax]
 
 
         n = adata.n_obs
@@ -204,6 +219,25 @@ class Inference:
         return adata
 
     # === CLUSTER / SUBCLASS ===
+    def _celltype_log_prior(self, n_classes, device):
+        """Log class-frequency prior over cell types for long-tail logit adjustment.
+
+        Derived from the reference slices' tokens -- legitimately available at test
+        time (same source the majority_baseline branch uses), so no GT leakage.
+        Laplace-smoothed so classes unseen in the references still get a finite
+        (floored) log-prior instead of -inf. Cached across calls."""
+        cached = getattr(self, "_ct_log_prior_cache", None)
+        if cached is not None and cached.shape[0] == n_classes:
+            return cached.to(device)
+        ref = ad.concat(self.slice_data_loader.reference_slices)
+        tokens = np.asarray(ref.obs["token"]).astype(int)
+        counts = np.bincount(tokens, minlength=n_classes).astype(np.float64)
+        counts += 1.0  # Laplace smoothing: no log(0) for unseen classes
+        freq = counts / counts.sum()
+        log_prior = torch.tensor(np.log(freq), dtype=torch.float32, device=device)
+        self._ct_log_prior_cache = log_prior
+        return log_prior
+
     def infer_cluster(self, adata, new_tissue):
         clust_type = self.config["cluster_inference_type"]
 
@@ -238,6 +272,11 @@ class Inference:
             region_model.eval()
 
             sample_from_probs = True
+            # (#1) temperature scaling + (#2) long-tail logit adjustment, applied to
+            # the cell-type logits before sampling. Defaults (T=1, alpha=0) reproduce
+            # the previous plain-sampling behavior byte-for-byte.
+            temperature = float(self.config.get("cluster_temperature", 1.0))
+            prior_alpha = float(self.config.get("cluster_prior_alpha", 0.0))
 
             with torch.no_grad():
                 xyz_tensor = torch.tensor(xyz, dtype=torch.float32).to(
@@ -251,6 +290,15 @@ class Inference:
                     # logits_batch = region_model.model(input_tensor[i : i + batch_size], xyz_tensor, torch.tensor(self.slice_data_loader.test_slices[0].obsm["knn_idx"][i : i + batch_size]).cuda())
                     outputs.append(logits_batch)
                 logits = torch.cat(outputs, dim=0)
+
+                # (#1) flatten overconfident softmaxes so sampling reaches the tail.
+                if temperature != 1.0:
+                    logits = logits / temperature
+                # (#2) subtract alpha*log(prior) to boost rare types toward their
+                # reference-slice marginal abundance.
+                if prior_alpha != 0.0:
+                    log_prior = self._celltype_log_prior(logits.shape[1], logits.device)
+                    logits = logits - prior_alpha * log_prior
 
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
 
@@ -546,7 +594,7 @@ class Inference:
 
         plt.scatter(
             pred_data.obsm["spatial"][
-                :, (2 if self.config["data_mode"] == "rq4" else 0)
+                :, (2 if is_sagittal_mode(self.config["data_mode"]) else 0)
             ],
             pred_data.obsm["spatial"][:, 1],
             s=0.1,
@@ -564,7 +612,7 @@ class Inference:
         # Ground truth
         plt.scatter(
             real_data.obsm["aligned_spatial"][
-                :, (2 if self.config["data_mode"] == "rq4" else 0)
+                :, (2 if is_sagittal_mode(self.config["data_mode"]) else 0)
             ],
             real_data.obsm["aligned_spatial"][:, 1],
             s=0.1,
@@ -596,7 +644,7 @@ class Inference:
             spot_size=0.003,
             figsize=(10, 10),
             save=f"./{self.config['artifact_dir']}/real_data_clusters.png",
-            saggital="rq4" in self.config["data_mode"],
+            saggital=is_sagittal_mode(self.config["data_mode"]),
         )
         plot_spatial_with_palette(
             pred_data,
@@ -604,7 +652,7 @@ class Inference:
             spot_size=0.003,
             figsize=(10, 10),
             save=f"./{self.config['artifact_dir']}/pred_data_clusters.png",
-            saggital="rq4" in self.config["data_mode"],
+            saggital=is_sagittal_mode(self.config["data_mode"]),
         )
 
         if "end" in self.config["expression_inference_type"]:

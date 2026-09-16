@@ -474,7 +474,23 @@ class SkeletonCelltypeModel2(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-    def fit(self, train_adata, val_adata=None, batch_size=32, epochs=10):
+    def fit(self, train_adata, val_adata=None, batch_size=32, epochs=10, early_stop_patience=5,
+            neighbor_tokens=None, neighborhood_weight=0.0):
+        """Train the position -> cell-type classifier.
+
+        neighbor_tokens / neighborhood_weight enable the neighborhood-KL objective:
+        instead of (only) the one-hot label, fit each cell's softmax to the cell-type
+        DISTRIBUTION of its spatial neighborhood. This is soft cross-entropy =
+        forward KL(neighborhood || model), which is mode-COVERING (won't drop the
+        tail), and teaches the position->local-composition map so rare types land
+        where GT concentrates them rather than at a uniform base rate.
+
+        neighbor_tokens: (N, k) int array of each train cell's k neighbor token-ids
+                         (same row order as train_adata), precomputed by the caller.
+        neighborhood_weight (lambda in [0,1]): loss = lambda * neighborhood_CE
+                         + (1 - lambda) * hard_CE. 0 = original hard-label training
+                         (byte-identical); 1 = pure neighborhood distribution.
+        """
         X_train = torch.tensor(
             train_adata.obsm["aligned_spatial"], dtype=torch.float32
         ).to(self.device)
@@ -482,12 +498,22 @@ class SkeletonCelltypeModel2(nn.Module):
             self.device
         )
 
-        dataset = TensorDataset(X_train, y_train)
+        use_nbhd = neighbor_tokens is not None and neighborhood_weight > 0.0
+        if use_nbhd:
+            assert neighbor_tokens.shape[0] == X_train.shape[0], (
+                f"neighbor_tokens rows {neighbor_tokens.shape[0]} != train cells {X_train.shape[0]}"
+            )
+            # int32 on-device to halve memory vs int64; cast per-batch for gather.
+            nbr_train = torch.as_tensor(neighbor_tokens, dtype=torch.int32).to(self.device)
+            dataset = TensorDataset(X_train, y_train, nbr_train)
+            print(f"🧭 neighborhood-KL objective ON: k={neighbor_tokens.shape[1]} "
+                  f"lambda={neighborhood_weight}")
+        else:
+            dataset = TensorDataset(X_train, y_train)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         best_val_score = -1
         val_scores = []
-        early_stop_patience = 5
         epochs_since_improvement = 0
 
         for epoch in range(epochs):
@@ -511,10 +537,26 @@ class SkeletonCelltypeModel2(nn.Module):
                     print("⏹️ Early stopping triggered due to no improvement.")
                     break
 
-            for xb, yb in dataloader:
+            for batch in dataloader:
+                if use_nbhd:
+                    xb, yb, nbrb = batch
+                else:
+                    xb, yb = batch
                 self.optimizer.zero_grad()
                 outputs = self.model(xb)
-                loss = self.loss_fn(outputs, yb)
+                if use_nbhd:
+                    # forward-KL / soft-CE to the neighborhood distribution, computed
+                    # exactly as the mean per-neighbor CE (avoids materializing dense
+                    # C-wide targets): -(1/k) sum_n log softmax(logits)[token_n].
+                    logp = torch.log_softmax(outputs, dim=1)
+                    nbhd_ce = -logp.gather(1, nbrb.long()).mean()
+                    if neighborhood_weight >= 1.0:
+                        loss = nbhd_ce
+                    else:
+                        hard_ce = self.loss_fn(outputs, yb)
+                        loss = neighborhood_weight * nbhd_ce + (1.0 - neighborhood_weight) * hard_ce
+                else:
+                    loss = self.loss_fn(outputs, yb)
                 loss.backward()
                 self.optimizer.step()
 
@@ -534,31 +576,34 @@ class SkeletonCelltypeModel2(nn.Module):
             torch.save(self.model.state_dict(), "best_model.pt")
             print("💾 Best model restored and saved to best_model.pt")
 
-    def evaluate_val(self, val_adata):
-        with torch.no_grad():
-            val_x_full = torch.tensor(
-                val_adata.obsm["aligned_spatial"], dtype=torch.float32
-            ).to(self.device)
-            n = val_x_full.shape[0]
-            sample_size = max(1, n // 100)
-            idx = np.random.choice(n, sample_size, replace=False)
+    def evaluate_val(self, val_adata, sample_size=50000):
+        # Low-variance validation score for model selection. The original version
+        # drew a fresh random n//100 subset each call AND sampled predictions
+        # stochastically, so the early-stopping signal was dominated by noise and
+        # tripped prematurely. Here we cache a fixed subset across epochs and use
+        # deterministic argmax predictions, so the score reflects real learning.
+        n = val_adata.n_obs
+        if getattr(self, "_val_eval_idx", None) is None or len(self._val_eval_idx) > n:
+            rng = np.random.default_rng(0)
+            k = min(sample_size, n)
+            self._val_eval_idx = np.sort(rng.choice(n, size=k, replace=False))
+        idx = self._val_eval_idx
 
-            val_x = val_x_full[idx]
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            val_x = torch.tensor(
+                val_adata.obsm["aligned_spatial"][idx], dtype=torch.float32
+            ).to(self.device)
             outputs = self.model(val_x)
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            preds = [
-                np.random.choice(probs.shape[1], p=probs[i])
-                for i in range(probs.shape[0])
-            ]
+            preds = torch.argmax(outputs, dim=1).cpu().numpy().tolist()
+        if was_training:
+            self.model.train()
 
         gt_celltypes = val_adata.obs["token"].to_numpy()[idx].tolist()
-        gt_positions = val_adata.obsm["aligned_spatial"][idx]
-        pred_positions = val_adata.obsm["aligned_spatial"][idx]
-        pred_celltypes = preds
+        positions = val_adata.obsm["aligned_spatial"][idx]
 
-        return soft_accuracy(
-            gt_celltypes, gt_positions, pred_celltypes, pred_positions, k=20
-        )
+        return soft_accuracy(gt_celltypes, positions, preds, positions, k=20)
 
     def get_token_distr(self, x):
         self.model.eval()
