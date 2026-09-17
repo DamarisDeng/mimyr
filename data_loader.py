@@ -15,7 +15,7 @@ class SliceDataLoader:
         mode="intra",
         label="subclass",
         cfg=None,
-        metadata_dir="/work/magroup/skrieger/tissue_generator/spencer_gentran/generative_transformer/metadata/",
+        metadata_dir="/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata/",
     ):
         """
         Args:
@@ -44,7 +44,7 @@ class SliceDataLoader:
 
     def load_intra_slices(self, fast=False, fast_select=None):
         # Load only slices1
-        input_dir = self.cfg["data_dir"] + "/subclass_z1_d338_0_rotated"
+        input_dir = self.cfg["data_dir"] + "/MERSCOPE"
         sorted_slices1 = [
             "sec_05.h5ad",
             "sec_06.h5ad",
@@ -123,7 +123,7 @@ class SliceDataLoader:
 
         # Load slices2
         input_dir = (
-            f"/work/magroup/skrieger/MERFISH_BICCN/processed_data/Zhuang-ABCA-{n}"
+            f"{self.cfg['data_dir']}/Zhuang-ABCA-{n}"
         )
         if remove_edges:
             sorted_slices2 = sorted(
@@ -166,7 +166,7 @@ class SliceDataLoader:
 
     def load_diseased_slices(self):
         # Load only slices1
-        input_dir = "/work/magroup/skrieger/tissue_generator/CCF_registration/ccf_aligned_Trem2_5xFAD/cleaned_versions/"
+        input_dir = f"{self.cfg['data_dir']}/cleaned_versions"
         sorted_slices1 = [
             "Trem2_5xFAD1_cleaned.h5ad",
             "Trem2_5xFAD2_cleaned.h5ad",

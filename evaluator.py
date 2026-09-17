@@ -13,7 +13,7 @@ class Evaluator:
     def __init__(
         self,
         config,
-        metadata_dir="/work/magroup/skrieger/tissue_generator/spencer_gentran/generative_transformer/metadata/",
+        metadata_dir="/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata/",
     ):
         self.config = config
         self.gene_set = torch.load(f"{metadata_dir}{config['meta_info']}")["gene_set"]

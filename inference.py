@@ -534,7 +534,7 @@ class Inferernce:
             color_key="token",
             spot_size=0.003,
             figsize=(10, 10),
-            save=f"./{self.config['artifact_dir']}/real_data_clusters.png",
+            save=f"{self.config['artifact_dir']}/real_data_clusters.png",
             saggital="rq4" in self.config["data_mode"],
         )
         plot_spatial_with_palette(
@@ -542,7 +542,7 @@ class Inferernce:
             color_key="token",
             spot_size=0.003,
             figsize=(10, 10),
-            save=f"./{self.config['artifact_dir']}/pred_data_clusters.png",
+            save=f"{self.config['artifact_dir']}/pred_data_clusters.png",
             saggital="rq4" in self.config["data_mode"],
         )
 
