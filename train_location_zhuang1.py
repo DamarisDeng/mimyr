@@ -48,10 +48,10 @@ from models.diffusion_model import DDPMTrainer
 # The production checkpoint loads exactly into this arch (verified via load_state_dict).
 from models.combined_model import TrainConfig
 
-DATA_DIR = "/work/magroup/skrieger/tissue_generator/quantized_slices"
-META_DIR = "/work/magroup/skrieger/tissue_generator/spencer_mimyr/models/generative_transformer/metadata"
+DATA_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/data"
+META_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata"
 META_INFO = f"{META_DIR}/4hierarchy_metainfo_mouse_geneunion2_DAG.pt"
-ZHUANG_DIR = "/work/magroup/skrieger/MERFISH_BICCN/processed_data"
+ZHUANG_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/data"
 
 
 def build_cond(aligned_spatial):

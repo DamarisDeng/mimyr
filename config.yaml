@@ -13,15 +13,15 @@
 # Data paths
 # ---------------------------------------------------------------------------
 
-# Root directory for rq1 data (the quantized_slices tree).
-data_dir: /work/magroup/skrieger/tissue_generator/quantized_slices
+# Root directory for rq1 data (contains MERSCOPE/).
+data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data
 
 # Base directory for Zhuang MERFISH data. Must contain subdirectories named
 # Zhuang-ABCA-2, Zhuang-ABCA-3, etc. Required for modes: rq2, rq2_v2, rq3, rq3_v2, rq4.
-zhuang_data_dir: /work/magroup/skrieger/MERFISH_BICCN/processed_data
+zhuang_data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data
 
 # Directory containing the diseased (5xFAD Trem2) .h5ad files. Required for rq5.
-diseased_data_dir: /work/magroup/skrieger/tissue_generator/CCF_registration/ccf_aligned_Trem2_5xFAD/cleaned_versions
+diseased_data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data/cleaned_versions
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -31,10 +31,10 @@ diseased_data_dir: /work/magroup/skrieger/tissue_generator/CCF_registration/ccf_
 #   edges_x.pkl, edges_y.pkl, edges_z.pkl  — coordinate bin edges
 #   hierarchy.pkl                           — cell-type hierarchy
 #   <meta_info>.pt                          — token/gene set (pointed to by --meta_info)
-expression_metadata_dir: /work/magroup/skrieger/tissue_generator/spencer_mimyr/models/generative_transformer/metadata
+expression_metadata_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata
 
 # Full path to the meta_info .pt file (token/gene set used by the expression model).
-meta_info: /work/magroup/skrieger/tissue_generator/spencer_mimyr/models/generative_transformer/metadata/4hierarchy_metainfo_mouse_geneunion2_DAG.pt
+meta_info: /work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata/4hierarchy_metainfo_mouse_geneunion2_DAG.pt
 
 # ---------------------------------------------------------------------------
 # Model checkpoints

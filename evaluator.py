@@ -19,7 +19,7 @@ class Evaluator:
     def __init__(
         self,
         config,
-        metadata_dir="model_checkpoints/metadata",
+        metadata_dir="/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata",
         gene_set_file=None,
     ):
         self.config = config

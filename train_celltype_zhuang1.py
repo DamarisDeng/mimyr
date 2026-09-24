@@ -50,10 +50,10 @@ def compute_neighbor_tokens(adata, k, cache_path=None):
 
 # Match eval_spatialz_rq3distance_new.py exactly so the token vocab lines up with
 # the rest of the pipeline at inference time.
-DATA_DIR = "/work/magroup/skrieger/tissue_generator/quantized_slices"
-META_DIR = "/work/magroup/skrieger/tissue_generator/spencer_mimyr/models/generative_transformer/metadata"
+DATA_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/data"
+META_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata"
 META_INFO = f"{META_DIR}/4hierarchy_metainfo_mouse_geneunion2_DAG.pt"
-ZHUANG_DIR = "/work/magroup/skrieger/MERFISH_BICCN/processed_data"
+ZHUANG_DIR = "/work/pi_f008n64_dartmouth_edu/Mimyr/data"
 
 N_CLASSES = 5274  # kept identical to the current cell-type model (SkeletonCelltypeModel2(5274))
 

@@ -103,7 +103,7 @@ class SliceDataLoader:
         mode="intra",
         label="subclass",
         cfg=None,
-        metadata_dir="model_checkpoints/metadata",
+        metadata_dir="/work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata",
         omit_x=False,
     ):
         """

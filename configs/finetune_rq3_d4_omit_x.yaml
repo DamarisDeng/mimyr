@@ -4,11 +4,11 @@
 
 # --- Paths ---
 # data_dir points to the local data/ folder for CCF CSV files used by rq3
-data_dir: /work/magroup/skrieger/tissue_generator/quantized_slices
-zhuang_data_dir: /work/magroup/skrieger/MERFISH_BICCN/processed_data
-diseased_data_dir: /work/magroup/skrieger/tissue_generator/CCF_registration/ccf_aligned_Trem2_5xFAD/cleaned_versions
-expression_metadata_dir: /work/magroup/skrieger/tissue_generator/spencer_gentran/generative_transformer/metadata
-meta_info: /work/magroup/skrieger/tissue_generator/MERFISH_aging/4hierarchy_metainfo_mouse_geneunion2_DAG.pt
+data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data
+zhuang_data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data
+diseased_data_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/data/cleaned_versions
+expression_metadata_dir: /work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata
+meta_info: /work/pi_f008n64_dartmouth_edu/Mimyr/spencer_code/models/generative_transformer/metadata/4hierarchy_metainfo_mouse_geneunion2_DAG.pt
 
 # --- Job settings ---
 run_mode: train
