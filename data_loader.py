@@ -136,7 +136,7 @@ class SliceDataLoader:
 
     def load_intra_slices(self, fast=False, fast_select=None, select_indices=None):
         # Load only slices1
-        input_dir = self.cfg["data_dir"] + "/subclass_z1_d338_0_rotated"
+        input_dir = self.cfg["data_dir"] + "/MERSCOPE"
         sorted_slices1 = [
             "sec_05.h5ad",
             "sec_06.h5ad",
@@ -234,7 +234,7 @@ class SliceDataLoader:
         Returns:
             sorted, deduplicated list of selected rq1 indices
         """
-        input_dir = os.path.join(self.cfg["data_dir"], "subclass_z1_d338_0_rotated")
+        input_dir = os.path.join(self.cfg["data_dir"], "MERSCOPE")
         sorted_slices1 = [
             "sec_05.h5ad", "sec_06.h5ad", "sec_08.h5ad", "sec_09.h5ad",
             "sec_10.h5ad", "sec_11.h5ad", "sec_12.h5ad", "sec_13.h5ad",
